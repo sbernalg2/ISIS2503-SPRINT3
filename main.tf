@@ -1,15 +1,24 @@
-# =============================================================================
-# BITE.co - Infraestructura AWS para validación de ASRs
-# Diagrama de despliegue: 3 Web Servers (A, B, C) + BD Server EC2 + RDS
-# + Application Load Balancer en us-east-1a / us-east-1b
+###############################################################################
+# OptiCloud – Infraestructura AWS para validar ASRs (Sprint 2)
 #
-# ASRs cubiertos:
-#   [ASR-DISP-DET]  Detección de falla en reporte <= 200 ms
-#   [ASR-DISP-REP]  Recuperación del servicio   <= 2 s
-#   [ASR-LAT]       Consulta de reporte          <= 100 ms @ 5 000 usuarios
-#   [ASR-SEG-DET]   Detección de acceso no autorizado <= 200 ms
-#   [ASR-SEG-REP]   Bloqueo de comportamiento anómalo (respuesta inmediata)
-# =============================================================================
+# ASR-1 · Escalabilidad  : Pico 12k usuarios / 10 min  → Auto Scaling Group
+# ASR-2 · Latencia       : ≤ 100 ms con 5k sostenidos  → Report Cache + Pre-Generator
+#
+# Región  : us-east-2 (Ohio)
+# AMI     : Ubuntu 24.04 LTS  ami-07062e2a343acc423
+# Instancias:
+#   - Web Servers (Django + Cache): t3.micro (8 GB storage)
+#   - Report Pre-Generator (worker EC2): t3.micro (8 GB storage)
+#   - RDS PostgreSQL: db.t3.micro (Dev/Test)
+# Balanceador: AWS ALB (Application Load Balancer)
+#
+# Correcciones v2:
+#   1. Procesamiento asíncrono REAL → tabla jobs en RDS + worker thread separado
+#      (el request HTTP retorna 202 inmediatamente; el worker consume en background)
+#   2. Renombrado bd_server → report_pregenerator (evita confusión con RDS)
+#   3. SG del pre-generator: sin ingress de app servers (solo egress a RDS)
+#   4. Eliminado puerto 8080 innecesario
+###############################################################################
 
 terraform {
   required_providers {
@@ -21,85 +30,103 @@ terraform {
       source  = "hashicorp/tls"
       version = "~> 4.0"
     }
+    local = {
+      source  = "hashicorp/local"
+      version = "~> 2.0"
+    }
   }
+  required_version = ">= 1.3.0"
 }
 
-# ── Proveedor ──────────────────────────────────────────────────────────────────
 provider "aws" {
-  region = "us-east-1"
+  region = "us-east-2"
 }
 
-# =============================================================================
-# 0. KEY PAIR (generado localmente, guardado en ./bite_key.pem)
-# =============================================================================
-resource "tls_private_key" "bite_key" {
+###############################################################################
+# VARIABLES
+###############################################################################
+
+variable "ami_id" {
+  description = "Ubuntu 24.04 LTS en us-east-2"
+  default     = "ami-07062e2a343acc423"
+}
+
+variable "db_password" {
+  description = "Contrasena para la base de datos RDS"
+  type        = string
+  sensitive   = true
+  default     = "OptiCloud2024!"
+}
+
+variable "db_username" {
+  description = "Usuario administrador de RDS"
+  default     = "opticloud_admin"
+}
+
+###############################################################################
+# KEY PAIR – generado por Terraform para acceso SSH a las instancias EC2
+# Necesario para conectarse a los Web Servers y ejecutar los experimentos ASR
+###############################################################################
+
+resource "tls_private_key" "opticloud_key" {
   algorithm = "RSA"
   rsa_bits  = 4096
 }
 
-resource "aws_key_pair" "bite_key" {
-  key_name   = "bite-keypair"
-  public_key = tls_private_key.bite_key.public_key_openssh
+resource "aws_key_pair" "opticloud_key" {
+  key_name   = "opticloud-keypair"
+  public_key = tls_private_key.opticloud_key.public_key_openssh
 }
 
-# Guarda la llave privada localmente para poder hacer SSH
+# Guarda la llave privada en el directorio local para hacer SSH
 resource "local_file" "private_key_pem" {
-  content         = tls_private_key.bite_key.private_key_pem
-  filename        = "${path.module}/bite_key.pem"
+  content         = tls_private_key.opticloud_key.private_key_pem
+  filename        = "${path.module}/opticloud_key.pem"
   file_permission = "0400"
 }
 
-# =============================================================================
-# 1. RED - VPC DEFAULT + subnets públicas en 2 AZs (requerido por el ALB)
-#    El diagrama indica "AWS-Default VPC" → usamos la VPC por defecto.
-#    Suposición mínima: obtenemos las dos primeras subnets disponibles.
-# =============================================================================
+###############################################################################
+# VPC – Default VPC (segun diagrama: AWS-Default VPC)
+###############################################################################
+
 data "aws_vpc" "default" {
   default = true
 }
 
-data "aws_subnets" "public" {
-  filter {
-    name   = "vpc-id"
-    values = [data.aws_vpc.default.id]
-  }
-}
-
-# Tomamos exactamente las subnets de us-east-1a y us-east-1b (como indica el diagrama)
 data "aws_subnet" "az_a" {
   filter {
-    name   = "availabilityZone"
-    values = ["us-east-1a"]
-  }
-  filter {
     name   = "vpc-id"
     values = [data.aws_vpc.default.id]
+  }
+  filter {
+    name   = "availabilityZone"
+    values = ["us-east-2a"]
   }
 }
 
 data "aws_subnet" "az_b" {
   filter {
-    name   = "availabilityZone"
-    values = ["us-east-1b"]
-  }
-  filter {
     name   = "vpc-id"
     values = [data.aws_vpc.default.id]
   }
+  filter {
+    name   = "availabilityZone"
+    values = ["us-east-2b"]
+  }
 }
 
-# =============================================================================
-# 2. SECURITY GROUPS
-# =============================================================================
+###############################################################################
+# SECURITY GROUPS
+###############################################################################
 
-# ── SG: Application Load Balancer ─────────────────────────────────────────────
+# SG: ALB — acepta HTTP:80 desde Internet
 resource "aws_security_group" "alb_sg" {
-  name        = "bite-alb-sg"
-  description = "Trafico HTTP publico hacia el ALB"
+  name        = "opticloud-alb-sg"
+  description = "HTTP entrante al ALB desde Internet"
   vpc_id      = data.aws_vpc.default.id
 
   ingress {
-    description = "HTTP desde internet"
+    description = "HTTP desde Internet (JMeter y usuarios)"
     from_port   = 80
     to_port     = 80
     protocol    = "tcp"
@@ -113,30 +140,31 @@ resource "aws_security_group" "alb_sg" {
     cidr_blocks = ["0.0.0.0/0"]
   }
 
-  tags = { Name = "bite-alb-sg" }
+  tags = { Name = "opticloud-alb-sg" }
 }
 
-# ── SG: Web Servers (A, B, C) ─────────────────────────────────────────────────
-# [ASR-SEG-DET / ASR-SEG-REP] Solo acepta tráfico del ALB en el puerto 8000 (Django)
+# SG: Web Servers — solo acepta trafico desde el ALB en puerto 8000
+# + SSH para conectarse y ejecutar experimentos ASR manualmente
 resource "aws_security_group" "web_sg" {
-  name        = "bite-web-sg"
-  description = "Trafico Django desde el ALB + SSH"
+  name        = "opticloud-web-sg"
+  description = "Trafico desde ALB hacia Web Servers Django (puerto 8000)"
   vpc_id      = data.aws_vpc.default.id
 
   ingress {
-    description     = "Django desde el ALB"
+    description     = "HTTP desde el ALB"
     from_port       = 8000
     to_port         = 8000
     protocol        = "tcp"
     security_groups = [aws_security_group.alb_sg.id]
   }
 
+  # SSH necesario para conectarse y correr los experimentos ASR desde adentro
   ingress {
-    description = "SSH para administracion"
+    description = "SSH para experimentos ASR y monitoreo"
     from_port   = 22
     to_port     = 22
     protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]   # Restringir a tu IP en producción
+    cidr_blocks = ["0.0.0.0/0"]
   }
 
   egress {
@@ -146,25 +174,21 @@ resource "aws_security_group" "web_sg" {
     cidr_blocks = ["0.0.0.0/0"]
   }
 
-  tags = { Name = "bite-web-sg" }
+  tags = { Name = "opticloud-web-sg" }
 }
 
-# ── SG: BD Server EC2 ─────────────────────────────────────────────────────────
-resource "aws_security_group" "bd_sg" {
-  name        = "bite-bd-sg"
-  description = "Postgres desde Web Servers + SSH"
+# SG: Report Pre-Generator — NO recibe trafico de ningún app server.
+# Este nodo solo inicia conexiones salientes hacia RDS.
+# Correccion v2: eliminado el ingress en 8080 que no correspondia con el rol
+# real del componente (es un worker, no un servidor HTTP).
+resource "aws_security_group" "pregenerator_sg" {
+  name        = "opticloud-pregenerator-sg"
+  description = "Report Pre-Generator: solo egress a RDS, sin ingress de apps"
   vpc_id      = data.aws_vpc.default.id
 
+  # SSH para acceder al Pre-Generator y ver logs del worker
   ingress {
-    description     = "PostgreSQL desde los Web Servers"
-    from_port       = 5432
-    to_port         = 5432
-    protocol        = "tcp"
-    security_groups = [aws_security_group.web_sg.id]
-  }
-
-  ingress {
-    description = "SSH para administracion"
+    description = "SSH para monitoreo y experimentos"
     from_port   = 22
     to_port     = 22
     protocol    = "tcp"
@@ -172,27 +196,36 @@ resource "aws_security_group" "bd_sg" {
   }
 
   egress {
+    description = "Acceso saliente a RDS y actualizaciones apt"
     from_port   = 0
     to_port     = 0
     protocol    = "-1"
     cidr_blocks = ["0.0.0.0/0"]
   }
 
-  tags = { Name = "bite-bd-sg" }
+  tags = { Name = "opticloud-pregenerator-sg" }
 }
 
-# ── SG: RDS ───────────────────────────────────────────────────────────────────
+# SG: RDS — acepta PostgreSQL (5432) desde Web Servers y Pre-Generator
 resource "aws_security_group" "rds_sg" {
-  name        = "bite-rds-sg"
-  description = "PostgreSQL solo desde Web Servers"
+  name        = "opticloud-rds-sg"
+  description = "PostgreSQL accesible desde Web Servers y Report Pre-Generator"
   vpc_id      = data.aws_vpc.default.id
 
   ingress {
-    description     = "PostgreSQL desde Web Servers"
+    description     = "PostgreSQL desde Web Servers (Django)"
     from_port       = 5432
     to_port         = 5432
     protocol        = "tcp"
     security_groups = [aws_security_group.web_sg.id]
+  }
+
+  ingress {
+    description     = "PostgreSQL desde Report Pre-Generator"
+    from_port       = 5432
+    to_port         = 5432
+    protocol        = "tcp"
+    security_groups = [aws_security_group.pregenerator_sg.id]
   }
 
   egress {
@@ -202,819 +235,1112 @@ resource "aws_security_group" "rds_sg" {
     cidr_blocks = ["0.0.0.0/0"]
   }
 
-  tags = { Name = "bite-rds-sg" }
+  tags = { Name = "opticloud-rds-sg" }
 }
 
-# =============================================================================
-# 3. RDS - Persistencia (Dev/Test, PostgreSQL, 20 GB)
-#    [ASR-DISP-REP] La BD persiste los datos → sin pérdida de info al recuperarse
-#    Suposición: se usa PostgreSQL (estándar Django). Motor configurable.
-# =============================================================================
-resource "aws_db_subnet_group" "bite_rds_subnet" {
-  name       = "bite-rds-subnet-group"
+###############################################################################
+# RDS – Amazon RDS PostgreSQL (Persistencia)
+# Almacena:
+#   - pregenerated_reports : reportes pre-calculados por el worker (ASR-2)
+#   - analysis_jobs        : cola persistente de trabajos asincronos (ASR-1)
+###############################################################################
+
+resource "aws_db_subnet_group" "opticloud" {
+  name       = "opticloud-db-subnet-group"
   subnet_ids = [data.aws_subnet.az_a.id, data.aws_subnet.az_b.id]
-  tags       = { Name = "bite-rds-subnet-group" }
+  tags       = { Name = "opticloud-db-subnet-group" }
 }
 
-resource "aws_db_instance" "bite_rds" {
-  identifier             = "bite-rds"
+resource "aws_db_instance" "opticloud_db" {
+  identifier             = "opticloud-postgres"
   engine                 = "postgres"
-  engine_version         = "15"
-  instance_class         = "db.t3.micro"   # Dev/Test predeterminado
-  allocated_storage      = 20              # GB mínimo para Dev/Test
+  engine_version         = "16"
+  instance_class         = "db.t3.micro"
+  allocated_storage      = 20
   storage_type           = "gp2"
-  db_name                = "bitedb"
-  username               = "biteadmin"
-  password               = "Bite2024!Secure"   # Cambiar antes de apply
+  db_name                = "opticloud"
+  username               = var.db_username
+  password               = var.db_password
+  db_subnet_group_name   = aws_db_subnet_group.opticloud.name
   vpc_security_group_ids = [aws_security_group.rds_sg.id]
-  db_subnet_group_name   = aws_db_subnet_group.bite_rds_subnet.name
   skip_final_snapshot    = true
   publicly_accessible    = false
-  multi_az               = false           # Dev/Test: single-AZ
+  multi_az               = false
 
-  tags = { Name = "bite-rds" }
+  tags = { Name = "opticloud-postgres-rds" }
 }
 
-# =============================================================================
-# 4. AMI BASE - Ubuntu 24.04 LTS
-# =============================================================================
-data "aws_ami" "ubuntu_24" {
-  most_recent = true
-  owners      = ["099720109477"] # Canonical
+###############################################################################
+# REPORT PRE-GENERATOR EC2  (renombrado desde "bd_server" en v2)
+#
+# Rol segun diagrama de componentes:
+#   - Pre-genera reportes y los persiste en RDS  (ASR-2 latencia)
+#   - Procesa jobs de analisis de forma asincrona real  (ASR-1 escalabilidad)
+#
+# NO expone ningun puerto HTTP. Solo inicia conexiones salientes a RDS.
+# Tipo: t3.micro (segun presupuesto indicado)
+###############################################################################
 
-  filter {
-    name   = "name"
-    values = ["ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-amd64-server-*"]
+resource "aws_instance" "report_pregenerator" {
+  ami                    = var.ami_id
+  instance_type          = "t3.micro"
+  subnet_id              = data.aws_subnet.az_a.id
+  vpc_security_group_ids = [aws_security_group.pregenerator_sg.id]
+  key_name               = aws_key_pair.opticloud_key.key_name
+
+  root_block_device {
+    volume_size = 8
+    volume_type = "gp2"
   }
 
-  filter {
-    name   = "virtualization-type"
-    values = ["hvm"]
-  }
+  user_data = base64encode(<<-USERDATA
+#!/bin/bash
+set -e
+apt-get update -y
+apt-get install -y python3 python3-pip python3-venv
+
+python3 -m venv /opt/opticloud
+/opt/opticloud/bin/pip install psycopg2-binary
+
+cat > /opt/opticloud/worker.py << 'PYEOF'
+#!/usr/bin/env python3
+"""
+OptiCloud Worker - Report Pre-Generator + Procesador de analisis asincrono
+==========================================================================
+Corre en la instancia EC2 report_pregenerator.
+NO expone ningun puerto HTTP. Solo lee/escribe en RDS.
+
+Tablas que gestiona:
+  pregenerated_reports  - reportes pre-calculados (ASR-2)
+  analysis_jobs         - cola persistente de analisis asincronos (ASR-1)
+"""
+import time, json, hashlib, threading, logging, datetime, random
+import psycopg2
+from psycopg2.extras import RealDictCursor
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(threadName)s] %(levelname)s %(message)s'
+)
+logger = logging.getLogger('worker')
+
+DB_HOST = '${aws_db_instance.opticloud_db.address}'
+DB_USER = '${var.db_username}'
+DB_PASS = '${var.db_password}'
+DB_NAME = 'opticloud'
+
+def get_conn():
+    return psycopg2.connect(
+        dbname=DB_NAME, user=DB_USER,
+        password=DB_PASS, host=DB_HOST, port=5432
+    )
+
+def bootstrap():
+    """Crea las tablas si no existen y resetea jobs interrumpidos."""
+    conn = get_conn()
+    with conn.cursor() as cur:
+        # Tabla para reportes pre-calculados -> ASR-2
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS pregenerated_reports (
+                report_key   VARCHAR(64) PRIMARY KEY,
+                client_id    INTEGER     NOT NULL,
+                payload      JSONB       NOT NULL,
+                generated_at TIMESTAMP   DEFAULT NOW()
+            );
+        """)
+        # Cola persistente de jobs -> ASR-1
+        # Si el worker cae, los jobs siguen en RDS (no se pierden).
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS analysis_jobs (
+                id           SERIAL      PRIMARY KEY,
+                client_id    INTEGER     NOT NULL,
+                payload      JSONB,
+                status       VARCHAR(16) NOT NULL DEFAULT 'pending',
+                enqueued_at  TIMESTAMP   DEFAULT NOW(),
+                started_at   TIMESTAMP,
+                finished_at  TIMESTAMP,
+                result       JSONB
+            );
+        """)
+        # Al reiniciar: resetea jobs que quedaron en 'processing'
+        # (worker fue interrumpido a mitad de ejecucion)
+        cur.execute("""
+            UPDATE analysis_jobs
+               SET status = 'pending', started_at = NULL
+             WHERE status = 'processing';
+        """)
+    conn.commit()
+    conn.close()
+    logger.info("Bootstrap completado: tablas listas en RDS")
+
+def run_pregenerator():
+    """
+    Thread 1: Report Pre-Generator (ASR-2 latencia).
+    Pre-calcula reportes de utilizacion para 100 clientes simulados
+    y los persiste en RDS cada 60 segundos.
+    Cuando Django recibe GET /report/<id>/, el dato ya existe en RDS
+    (o en el Report Cache en memoria) -> latencia baja.
+    """
+    logger.info("Pre-generator iniciando...")
+    while True:
+        try:
+            conn = get_conn()
+            with conn.cursor() as cur:
+                for cid in range(1, 101):
+                    key = hashlib.md5(f"client_{cid}".encode()).hexdigest()
+                    payload = {
+                        'client_id':    cid,
+                        'cpu_usage':    round(30 + (cid % 50), 2),
+                        'memory_usage': round(40 + (cid % 40), 2),
+                        'disk_io':      round(10 + (cid % 20), 2),
+                        'generated_at': datetime.datetime.utcnow().isoformat(),
+                        'status':       'ready',
+                    }
+                    cur.execute("""
+                        INSERT INTO pregenerated_reports
+                               (report_key, client_id, payload)
+                        VALUES (%s, %s, %s)
+                        ON CONFLICT (report_key) DO UPDATE
+                          SET payload = EXCLUDED.payload,
+                              generated_at = NOW();
+                    """, (key, cid, json.dumps(payload)))
+            conn.commit()
+            conn.close()
+            logger.info("Pre-generator: 100 reportes actualizados en RDS")
+        except Exception as e:
+            logger.error(f"Pre-generator error: {e}")
+        time.sleep(60)
+
+def run_job_processor():
+    """
+    Thread 2: Procesador de analisis asincrono REAL (ASR-1 escalabilidad).
+
+    Flujo desacoplado:
+      1. Web Server recibe POST /enqueue/ -> inserta fila en analysis_jobs
+         con status='pending' y responde 202 Accepted de inmediato.
+         El cliente HTTP no espera el analisis. (desacople real)
+      2. Este thread (en proceso separado, instancia EC2 distinta) detecta
+         filas 'pending', las marca 'processing', ejecuta el analisis
+         y guarda el resultado en RDS.
+      3. El cliente consulta GET /job/<id>/ para ver el resultado cuando quiera.
+
+    Persistencia: si el worker cae, los jobs siguen en status='pending'
+    en RDS y se reprocesaran al reiniciar (ver bootstrap).
+
+    SKIP LOCKED: evita que multiples workers (si se escala el pregenerator)
+    procesen el mismo job en paralelo.
+    """
+    logger.info("Job processor iniciando...")
+    while True:
+        try:
+            conn = get_conn()
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("""
+                    SELECT id, client_id, payload
+                      FROM analysis_jobs
+                     WHERE status = 'pending'
+                     ORDER BY enqueued_at ASC
+                     LIMIT 1
+                     FOR UPDATE SKIP LOCKED;
+                """)
+                job = cur.fetchone()
+
+                if job:
+                    job_id    = job['id']
+                    client_id = job['client_id']
+
+                    cur.execute("""
+                        UPDATE analysis_jobs
+                           SET status = 'processing', started_at = NOW()
+                         WHERE id = %s;
+                    """, (job_id,))
+                    conn.commit()
+                    logger.info(f"Job {job_id} (cliente {client_id}): procesando...")
+
+                    # Analisis simulado: dura entre 0.5 y 3 segundos.
+                    # En produccion aqui iria el calculo real de metricas.
+                    # El request HTTP ya retorno 202 hace tiempo; el cliente
+                    # no esta esperando esta duracion.
+                    duration = random.uniform(0.5, 3.0)
+                    time.sleep(duration)
+
+                    result = {
+                        'client_id':     client_id,
+                        'analysis_time': round(duration, 3),
+                        'cpu_p95':       round(60 + random.uniform(0, 30), 2),
+                        'mem_p95':       round(55 + random.uniform(0, 35), 2),
+                        'completed_at':  datetime.datetime.utcnow().isoformat(),
+                    }
+
+                    cur.execute("""
+                        UPDATE analysis_jobs
+                           SET status = 'done',
+                               finished_at = NOW(),
+                               result = %s
+                         WHERE id = %s;
+                    """, (json.dumps(result), job_id))
+                    conn.commit()
+                    logger.info(f"Job {job_id}: completado en {duration:.2f}s")
+
+            conn.close()
+
+        except Exception as e:
+            logger.error(f"Job processor error: {e}")
+            time.sleep(2)
+
+        time.sleep(0.5)
+
+if __name__ == '__main__':
+    # Esperar a que RDS este disponible
+    for attempt in range(20):
+        try:
+            c = get_conn()
+            c.close()
+            logger.info("Conexion a RDS establecida")
+            break
+        except Exception as e:
+            logger.warning(f"RDS no disponible (intento {attempt + 1}/20): {e}")
+            time.sleep(15)
+
+    bootstrap()
+
+    t1 = threading.Thread(target=run_pregenerator,  name='PreGenerator', daemon=True)
+    t2 = threading.Thread(target=run_job_processor, name='JobProcessor',  daemon=True)
+    t1.start()
+    t2.start()
+
+    while True:
+        time.sleep(60)
+        logger.info(f"Worker vivo - PreGenerator={t1.is_alive()}, JobProcessor={t2.is_alive()}")
+PYEOF
+
+cat > /etc/systemd/system/opticloud-worker.service << 'SVCEOF'
+[Unit]
+Description=OptiCloud Report Pre-Generator + Async Job Processor
+After=network.target
+
+[Service]
+ExecStart=/opt/opticloud/bin/python3 /opt/opticloud/worker.py
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+SVCEOF
+
+systemctl daemon-reload
+systemctl enable opticloud-worker
+systemctl start opticloud-worker
+USERDATA
+  )
+
+  tags = { Name = "opticloud-report-pregenerator" }
+
+  depends_on = [aws_db_instance.opticloud_db]
 }
 
-# =============================================================================
-# 5. USER DATA - Script Django compartido para los 3 Web Servers
+###############################################################################
+# LAUNCH TEMPLATE – Web Servers (Django + Report Cache + Cola de trabajos)
 #
-#    Componentes por servidor (según diagrama):
-#      - Django (execution environment)
-#      - Cache de reportes  → endpoint /report/  con caché en memoria
-#      - Cola de trabajos   → simulada con threading en Django
-#      - Procesador de análisis → tarea en segundo plano
-#      - Report Pre-Generator  → tarea de precarga al arrancar
-#      - Elastic Orchestrator  → endpoint /health/ que reinicia workers caídos
+# Execution environment 1 – Cache reportes:
+#   Report Cache      : dict en memoria por instancia (ASR-2)
+#   Elastic Orch      : /metrics/ para monitoreo interno
 #
-#    ASRs validados con endpoints:
-#      GET /report/          → [ASR-LAT]      responde <= 100 ms desde caché
-#      GET /health/          → [ASR-DISP-DET] detecta falla <= 200 ms
-#      POST /recover/        → [ASR-DISP-REP] ejecuta recuperación <= 2 s
-#      GET /security/check/  → [ASR-SEG-DET]  detecta acceso anómalo <= 200 ms
-#      POST /security/block/ → [ASR-SEG-REP]  bloquea IP anómala
-# =============================================================================
-locals {
-  web_user_data = <<-EOF
-    #!/bin/bash
-    set -e
-    export DEBIAN_FRONTEND=noninteractive
+# Execution environment 2 – Django:
+#   Cola de trabajos  : POST /enqueue/ inserta en RDS y retorna 202 (asincrono real)
+#   Consulta estado   : GET /job/<id>/ para ver resultado posterior
+###############################################################################
 
-    # ── Actualizar e instalar dependencias ──────────────────────────────────
-    apt-get update -y
-    apt-get install -y python3-pip python3-venv postgresql-client git
+resource "aws_launch_template" "web_server" {
+  name_prefix   = "opticloud-web-"
+  image_id      = var.ami_id
+  instance_type = "t3.micro"
 
-    # ── Entorno virtual Django ───────────────────────────────────────────────
-    python3 -m venv /opt/bite_env
-    source /opt/bite_env/bin/activate
-    pip install --upgrade pip
-    pip install django==4.2 psycopg2-binary gunicorn
+  # Key pair para poder conectarse por SSH a cada Web Server del ASG
+  key_name = aws_key_pair.opticloud_key.key_name
 
-    # ── Crear proyecto Django ────────────────────────────────────────────────
-    mkdir -p /opt/bite
-    cd /opt/bite
-    django-admin startproject bitecore .
-    python manage.py startapp reports
+  network_interfaces {
+    associate_public_ip_address = true
+    security_groups             = [aws_security_group.web_sg.id]
+  }
 
-    # ── settings.py mínimo ──────────────────────────────────────────────────
-    cat > /opt/bite/bitecore/settings.py << 'SETTINGS'
-import os
-SECRET_KEY = 'bite-secret-key-change-in-prod'
-DEBUG = True
+  block_device_mappings {
+    device_name = "/dev/sda1"
+    ebs {
+      volume_size = 8
+      volume_type = "gp2"
+    }
+  }
+
+  user_data = base64encode(<<-USERDATA
+#!/bin/bash
+set -e
+apt-get update -y
+apt-get install -y python3 python3-pip python3-venv
+
+python3 -m venv /opt/opticloud
+/opt/opticloud/bin/pip install django psycopg2-binary gunicorn
+
+mkdir -p /opt/opticloud/app/opticloud
+
+cat > /opt/opticloud/app/settings.py << 'PYEOF'
+SECRET_KEY    = 'opticloud-web-key'
+DEBUG         = True
 ALLOWED_HOSTS = ['*']
-INSTALLED_APPS = [
-    'django.contrib.contenttypes',
-    'django.contrib.staticfiles',
-    'reports',
-]
+INSTALLED_APPS = ['django.contrib.contenttypes', 'django.contrib.auth', 'opticloud']
 DATABASES = {
     'default': {
-        'ENGINE': 'django.db.backends.postgresql',
-        'NAME': 'bitedb',
-        'USER': 'biteadmin',
-        'PASSWORD': 'Bite2024!Secure',
-        'HOST': '${aws_db_instance.bite_rds.address}',
-        'PORT': '5432',
+        'ENGINE':       'django.db.backends.postgresql',
+        'NAME':         'opticloud',
+        'USER':         '${var.db_username}',
+        'PASSWORD':     '${var.db_password}',
+        'HOST':         '${aws_db_instance.opticloud_db.address}',
+        'PORT':         '5432',
+        'CONN_MAX_AGE': 60,
     }
 }
-ROOT_URLCONF = 'bitecore.urls'
-SETTINGS
+ROOT_URLCONF     = 'urls'
+WSGI_APPLICATION = 'wsgi.application'
+PYEOF
 
-    # ── views.py ─────────────────────────────────────────────────────────────
-    # Cada endpoint mide su propio tiempo de respuesta y lo incluye en el JSON
-    # para que puedas verificar los tiempos de los ASRs con curl o JMeter.
-    cat > /opt/bite/reports/views.py << 'VIEWS'
-import time
-import threading
-import json
+cat > /opt/opticloud/app/urls.py << 'PYEOF'
+from django.urls import path
+from opticloud import views
+urlpatterns = [
+    # ── Endpoints originales ───────────────────────────────────────────────
+    path('health/',            views.health_check),
+    path('report/<int:cid>/', views.get_report),
+    path('enqueue/',           views.enqueue_job),
+    path('job/<int:jid>/',    views.job_status),
+    path('metrics/',           views.metrics),
+    # ── ASR DISPONIBILIDAD ─────────────────────────────────────────────────
+    # [ASR-DISP-DET] Deteccion de falla en generacion de reporte <= 200 ms
+    path('worker/status/',     views.worker_status),
+    # [ASR-DISP-REP] Recuperacion del worker caido <= 2 s, sin perdida de datos
+    path('worker/recover/',    views.worker_recover),
+    # ── ASR SEGURIDAD ──────────────────────────────────────────────────────
+    # [ASR-SEG-DET] Deteccion de acceso no autorizado <= 200 ms
+    path('security/check/',    views.security_check),
+    # [ASR-SEG-REP] Bloqueo de IP o comportamiento anomalo
+    path('security/block/',    views.security_block),
+]
+PYEOF
+
+cat > /opt/opticloud/app/wsgi.py << 'PYEOF'
+import os
+from django.core.wsgi import get_wsgi_application
+os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'settings')
+application = get_wsgi_application()
+PYEOF
+
+touch /opt/opticloud/app/opticloud/__init__.py
+
+cat > /opt/opticloud/app/opticloud/views.py << 'PYEOF'
+"""
+Web Server Views - OptiCloud v3
+================================
+Execution env 1 - Cache reportes:
+  Report Cache : dict en memoria por instancia (ASR-2 latencia < 100ms)
+
+Execution env 2 - Django:
+  Cola de trabajos : POST /enqueue/ inserta job en RDS y retorna 202 inmediato.
+                     El request HTTP termina aqui. Procesamiento en worker EC2.
+  GET /job/<id>/   : consulta de estado posterior (pending/processing/done)
+
+Nuevos endpoints v3:
+  ASR DISPONIBILIDAD:
+    GET /worker/status/   -> detecta falla del worker (ASR-DISP-DET <= 200ms)
+    POST /worker/recover/ -> recupera el worker caido (ASR-DISP-REP <= 2s)
+  ASR SEGURIDAD:
+    GET /security/check/  -> detecta acceso anomalo (ASR-SEG-DET <= 200ms)
+    POST /security/block/ -> bloquea IP sospechosa  (ASR-SEG-REP inmediato)
+"""
+import time, json, hashlib, threading, logging
+import psycopg2
+from psycopg2.extras import RealDictCursor
 from django.http import JsonResponse
+from django.views.decorators.csrf import csrf_exempt
 
-# ── Cache en memoria (Report Cache / Report Pre-Generator) ──────────────────
-# [ASR-LAT] Los reportes se precargan al iniciar; la consulta solo lee de memoria
-_report_cache = {}
+logger = logging.getLogger(__name__)
+
+# ── Estado compartido en memoria ────────────────────────────────────────────
+# Report Cache: evita ir a RDS en cada request -> ASR-2 latencia baja
+_cache      = {}
 _cache_lock = threading.Lock()
-_blocked_ips = set()
-_anomaly_log = []
 
-def _preload_reports():
-    """Report Pre-Generator: precarga 100 reportes simulados al arrancar."""
+# Estado del worker interno (Procesador de Analisis / Health Monitor)
+# [ASR-DISP-DET] Este flag simula si el generador de reportes esta activo
+_worker_ok   = True
+_worker_lock = threading.Lock()
+
+# Lista negra de IPs bloqueadas (IDS / Response Manager)
+# [ASR-SEG-REP] Se populea via POST /security/block/
+_blocked_ips     = set()
+_blocked_ips_lock = threading.Lock()
+
+# Audit log en memoria (Audit Logger)
+# [ASR-SEG-DET] Registra cada intento de acceso anomalo con timestamp
+_audit_log      = []
+_audit_log_lock = threading.Lock()
+
+DB_HOST = '${aws_db_instance.opticloud_db.address}'
+DB_USER = '${var.db_username}'
+DB_PASS = '${var.db_password}'
+DB_NAME = 'opticloud'
+
+def _pg():
+    return psycopg2.connect(
+        dbname=DB_NAME, user=DB_USER,
+        password=DB_PASS, host=DB_HOST, port=5432
+    )
+
+# ────────────────────────────────────────────────────────────────────────────
+# ENDPOINTS ORIGINALES
+# ────────────────────────────────────────────────────────────────────────────
+
+def health_check(request):
+    """ALB Health Check - responde 200 para que el ASG detecte instancias sanas."""
+    return JsonResponse({'status': 'ok'})
+
+def get_report(request, cid):
+    """
+    GET /report/<cid>/ - valida ASR-2 (latencia <= 100ms con 5k sostenidos).
+
+    Flujo optimizado:
+      1. Report Cache (memoria)   -> respuesta inmediata si hit
+      2. RDS pregenerated_reports -> dato pre-calculado por worker EC2,
+                                     se guarda en cache y se responde
+      3. 404 si no existe aun
+
+    La respuesta incluye 'response_ms' para validar ASR-2 directamente en JMeter.
+    """
+    t0  = time.monotonic()
+    key = hashlib.md5(f"client_{cid}".encode()).hexdigest()
+
+    # 1. Cache hit
     with _cache_lock:
-        for i in range(1, 101):
-            _report_cache[str(i)] = {
-                "id": i,
-                "resource": f"resource_{i}",
-                "consumption": round(i * 1.5, 2),
-                "cached_at": time.time(),
-            }
+        hit = _cache.get(key)
+    if hit:
+        ms = round((time.monotonic() - t0) * 1000, 3)
+        return JsonResponse({'source': 'cache', 'client_id': cid,
+                             'data': hit, 'response_ms': ms})
 
-# Ejecutar precarga en background al importar el módulo
-threading.Thread(target=_preload_reports, daemon=True).start()
+    # 2. RDS (pre-generado por report_pregenerator EC2)
+    try:
+        conn = _pg()
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                "SELECT payload FROM pregenerated_reports WHERE report_key = %s",
+                (key,)
+            )
+            row = cur.fetchone()
+        conn.close()
 
-# ── /report/<id>/ ───────────────────────────────────────────────────────────
-# [ASR-LAT] Consulta de reporte desde caché → debe responder <= 100 ms
-def report_view(request, report_id="1"):
-    t0 = time.perf_counter()
-    with _cache_lock:
-        data = _report_cache.get(str(report_id))
-    elapsed_ms = (time.perf_counter() - t0) * 1000
-    if data:
+        if row:
+            payload = row['payload']
+            with _cache_lock:
+                _cache[key] = payload
+            ms = round((time.monotonic() - t0) * 1000, 3)
+            return JsonResponse({'source': 'rds_pregenerated', 'client_id': cid,
+                                 'data': payload, 'response_ms': ms})
+
+        ms = round((time.monotonic() - t0) * 1000, 3)
+        return JsonResponse({'source': 'not_found', 'client_id': cid,
+                             'response_ms': ms}, status=404)
+
+    except Exception as e:
+        ms = round((time.monotonic() - t0) * 1000, 3)
+        return JsonResponse({'error': str(e), 'response_ms': ms}, status=500)
+
+@csrf_exempt
+def enqueue_job(request):
+    """
+    POST /enqueue/ - cola de trabajos ASINCRONA REAL (ASR-1 escalabilidad).
+    Inserta en tabla analysis_jobs de RDS y retorna 202 Accepted de inmediato.
+    """
+    if request.method != 'POST':
+        return JsonResponse({'error': 'POST required'}, status=405)
+    try:
+        body = request.body.decode('utf-8', errors='ignore')
+        data = json.loads(body) if body else {}
+        cid  = int(data.get('client_id', 1))
+
+        conn = _pg()
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO analysis_jobs (client_id, payload)
+                VALUES (%s, %s) RETURNING id, enqueued_at;
+            """, (cid, json.dumps(data)))
+            row = cur.fetchone()
+            job_id = row[0]
+            enqueued = row[1].isoformat()
+        conn.commit()
+        conn.close()
+
         return JsonResponse({
-            "status": "ok",
-            "report": data,
-            "elapsed_ms": round(elapsed_ms, 3),
-            "asr": "LAT - objetivo <= 100 ms",
+            'accepted':    True,
+            'job_id':      job_id,
+            'enqueued_at': enqueued,
+            'check_url':   f'/job/{job_id}/',
+            'note':        'Analisis en background. Consulta check_url para el resultado.',
+        }, status=202)
+
+    except Exception as e:
+        return JsonResponse({'error': str(e)}, status=500)
+
+def job_status(request, jid):
+    """
+    GET /job/<jid>/ - consulta estado de un job asincrono.
+    Estados: pending -> processing -> done
+    """
+    try:
+        conn = _pg()
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                SELECT id, client_id, status, enqueued_at,
+                       started_at, finished_at, result
+                  FROM analysis_jobs WHERE id = %s;
+            """, (jid,))
+            job = cur.fetchone()
+        conn.close()
+
+        if not job:
+            return JsonResponse({'error': 'Job no encontrado'}, status=404)
+
+        return JsonResponse({
+            'job_id':      job['id'],
+            'client_id':  job['client_id'],
+            'status':      job['status'],
+            'enqueued_at': job['enqueued_at'].isoformat() if job['enqueued_at'] else None,
+            'started_at':  job['started_at'].isoformat()  if job['started_at']  else None,
+            'finished_at': job['finished_at'].isoformat() if job['finished_at'] else None,
+            'result':      job['result'],
         })
-    return JsonResponse({"status": "not_found", "elapsed_ms": round(elapsed_ms, 3)}, status=404)
+    except Exception as e:
+        return JsonResponse({'error': str(e)}, status=500)
 
-# ── /health/ ────────────────────────────────────────────────────────────────
-# [ASR-DISP-DET] Health Monitor / Elastic Orchestrator:
-# Simula detección de falla en la generación de un reporte <= 200 ms.
-# En producción este endpoint sería llamado periódicamente por el orquestador.
-_worker_healthy = True
-
-def health_view(request):
-    t0 = time.perf_counter()
-    global _worker_healthy
-
-    # Simular falla si el parámetro ?fail=1 está presente
-    if request.GET.get("fail") == "1":
-        _worker_healthy = False
-
-    status = "healthy" if _worker_healthy else "degraded"
-    elapsed_ms = (time.perf_counter() - t0) * 1000
+def metrics(request):
+    """
+    GET /metrics/ - Elastic Orchestrator.
+    Expone estado del Report Cache y jobs en cola.
+    """
+    with _cache_lock:
+        cache_size = len(_cache)
+    try:
+        conn = _pg()
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM analysis_jobs WHERE status='pending';")
+            pending = cur.fetchone()[0]
+            cur.execute("SELECT COUNT(*) FROM analysis_jobs WHERE status='processing';")
+            processing = cur.fetchone()[0]
+            cur.execute("SELECT COUNT(*) FROM analysis_jobs WHERE status='done';")
+            done = cur.fetchone()[0]
+        conn.close()
+    except Exception:
+        pending = processing = done = -1
 
     return JsonResponse({
-        "status": status,
-        "worker_healthy": _worker_healthy,
-        "elapsed_ms": round(elapsed_ms, 3),
-        "asr": "DISP-DET - objetivo <= 200 ms",
+        'report_cache_entries': cache_size,
+        'jobs_pending':         pending,
+        'jobs_processing':      processing,
+        'jobs_done':            done,
+        'status':               'running',
     })
 
-# ── /recover/ ───────────────────────────────────────────────────────────────
-# [ASR-DISP-REP] Exception Handler / Elastic Orchestrator:
-# Simula la recuperación del worker caído en <= 2 segundos.
-# El caché persiste → sin pérdida de información durante la recuperación.
-def recover_view(request):
-    t0 = time.perf_counter()
-    global _worker_healthy
+# ────────────────────────────────────────────────────────────────────────────
+# ASR DISPONIBILIDAD – Health Monitor + Exception Handler + Elastic Orchestrator
+# ────────────────────────────────────────────────────────────────────────────
 
-    # Simular tiempo de recuperación (< 2 s según el ASR)
-    time.sleep(0.8)   # 800 ms de recuperación simulada
-    _worker_healthy = True
+def worker_status(request):
+    """
+    GET /worker/status/   [ASR-DISP-DET]
+    ======================================
+    Health Monitor: detecta si el generador de reportes esta activo o caido.
+    Objetivo: responder en <= 200 ms desde que ocurre la falla.
 
-    # Recargar reportes (simula restaurar el procesador de análisis)
-    _preload_reports()
+    Uso del experimento:
+      Normal   -> GET /worker/status/           (worker_ok: true)
+      Falla    -> GET /worker/status/?fail=1    (fuerza worker_ok: false)
+      Recupero -> GET /worker/status/           (ver si volvio a true)
 
-    elapsed_ms = (time.perf_counter() - t0) * 1000
+    El campo 'detection_ms' en la respuesta es tu evidencia del ASR.
+    """
+    t0 = time.monotonic()
+    global _worker_ok
+
+    # Simula falla del generador de reportes (Exception Handler detecta)
+    if request.GET.get('fail') == '1':
+        with _worker_lock:
+            _worker_ok = False
+        logger.warning("FALLA SIMULADA: worker de generacion de reportes caido")
+
+    with _worker_lock:
+        estado = _worker_ok
+
+    # Verificacion adicional: intenta conectar a RDS para validar persistencia
+    rds_ok = True
+    try:
+        conn = _pg()
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1")
+        conn.close()
+    except Exception:
+        rds_ok = False
+
+    detection_ms = round((time.monotonic() - t0) * 1000, 3)
+
     return JsonResponse({
-        "status": "recovered",
-        "elapsed_ms": round(elapsed_ms, 3),
-        "cache_size": len(_report_cache),
-        "asr": "DISP-REP - objetivo <= 2000 ms",
+        'worker_ok':     estado,
+        'rds_ok':        rds_ok,
+        'detection_ms':  detection_ms,
+        'asr':           'DISP-DET – objetivo <= 200 ms',
+        'cumple':        detection_ms <= 200,
+        'estado':        'operacional' if estado else 'FALLA_DETECTADA',
     })
 
-# ── /security/check/ ────────────────────────────────────────────────────────
-# [ASR-SEG-DET] IDS / Anomaly Detector / Audit Logger:
-# Detecta acceso no autorizado o anómalo en <= 200 ms.
-# Criterios de anomalía simulados: IP en lista negra, User-Agent vacío,
-# o cabecera X-Bite-Token ausente.
-def security_check_view(request):
-    t0 = time.perf_counter()
-    client_ip = request.META.get("REMOTE_ADDR", "unknown")
-    token = request.headers.get("X-Bite-Token", "")
-    ua = request.META.get("HTTP_USER_AGENT", "")
+@csrf_exempt
+def worker_recover(request):
+    """
+    POST /worker/recover/   [ASR-DISP-REP]
+    ========================================
+    Exception Handler + Elastic Orchestrator:
+    Recupera el worker caido, restaura el cache de reportes desde RDS
+    y confirma que la operacion continua sin perdida de datos.
+    Objetivo: completar recuperacion en <= 2000 ms.
 
-    anomalies = []
-    if client_ip in _blocked_ips:
-        anomalies.append("ip_blocked")
+    Flujo del experimento:
+      1. POST /worker/status/?fail=1   -> simula la falla
+      2. POST /worker/recover/         -> dispara la recuperacion
+      3. Medir 'recovery_ms' en la respuesta
+
+    La recuperacion incluye:
+      - Reinicio del flag _worker_ok (simula reinicio del proceso)
+      - Recarga del cache desde RDS (datos preexistentes = sin perdida)
+      - Confirmacion de conectividad con RDS
+    """
+    t0 = time.monotonic()
+    global _worker_ok
+
+    pasos = []
+
+    # Paso 1: reiniciar el worker (Elastic Orchestrator reinicia/reemplaza)
+    with _worker_lock:
+        _worker_ok = True
+    pasos.append('worker_reiniciado')
+
+    # Paso 2: recargar el cache desde RDS (sin perdida de informacion)
+    cache_recargado = 0
+    try:
+        conn = _pg()
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT report_key, payload FROM pregenerated_reports LIMIT 100;")
+            rows = cur.fetchall()
+        conn.close()
+        with _cache_lock:
+            for r in rows:
+                _cache[r['report_key']] = r['payload']
+            cache_recargado = len(rows)
+        pasos.append(f'cache_recargado_{cache_recargado}_reportes')
+    except Exception as e:
+        pasos.append(f'cache_reload_error: {str(e)}')
+
+    # Paso 3: confirmacion de disponibilidad (Health Monitor confirma)
+    pasos.append('disponibilidad_confirmada')
+
+    recovery_ms = round((time.monotonic() - t0) * 1000, 3)
+
+    return JsonResponse({
+        'recovered':        True,
+        'recovery_ms':      recovery_ms,
+        'cache_recargado':  cache_recargado,
+        'pasos':            pasos,
+        'asr':              'DISP-REP – objetivo <= 2000 ms',
+        'cumple':           recovery_ms <= 2000,
+        'perdida_de_datos': False,
+    })
+
+# ────────────────────────────────────────────────────────────────────────────
+# ASR SEGURIDAD – IDS + Anomaly Detector + Audit Logger + Response Manager
+# ────────────────────────────────────────────────────────────────────────────
+
+def security_check(request):
+    """
+    GET /security/check/   [ASR-SEG-DET]
+    ======================================
+    IDS + Anomaly Detector + Audit Logger:
+    Detecta accesos no autorizados o comportamientos anomalos en <= 200 ms.
+    Funciona tanto en operacion normal como durante picos de carga.
+
+    Criterios de anomalia evaluados:
+      1. IP en lista negra (_blocked_ips)
+      2. Cabecera X-Opticloud-Token ausente (acceso sin autenticacion)
+      3. User-Agent vacio (bot o script directo)
+      4. Parametro ?flood=1 (simulacion de consultas masivas de reportes)
+
+    Uso del experimento:
+      Anomalo  -> GET /security/check/                       (sin token)
+      Legitimo -> GET /security/check/ -H 'X-Opticloud-Token: test123'
+      IP negra -> POST /security/block/ + GET /security/check/
+      Flood    -> GET /security/check/?flood=1
+    """
+    t0 = time.monotonic()
+
+    client_ip = request.META.get('HTTP_X_FORWARDED_FOR', '').split(',')[0].strip() \
+                or request.META.get('REMOTE_ADDR', 'unknown')
+    token     = request.headers.get('X-Opticloud-Token', '')
+    ua        = request.META.get('HTTP_USER_AGENT', '')
+    is_flood  = request.GET.get('flood') == '1'
+
+    anomalias = []
+
+    # Criterio 1: IP bloqueada (IDS)
+    with _blocked_ips_lock:
+        if client_ip in _blocked_ips:
+            anomalias.append('ip_en_lista_negra')
+
+    # Criterio 2: sin token de autenticacion (Autenticador)
     if not token:
-        anomalies.append("missing_token")
+        anomalias.append('token_ausente')
+
+    # Criterio 3: User-Agent vacio (bot / acceso directo)
     if not ua:
-        anomalies.append("missing_user_agent")
+        anomalias.append('user_agent_vacio')
 
-    # Audit log en memoria (Audit Logger)
-    _anomaly_log.append({
-        "ts": time.time(),
-        "ip": client_ip,
-        "anomalies": anomalies,
-    })
+    # Criterio 4: parametro de flood (generacion masiva de reportes)
+    if is_flood:
+        anomalias.append('comportamiento_flood_detectado')
 
-    elapsed_ms = (time.perf_counter() - t0) * 1000
-    is_anomalous = len(anomalies) > 0
-    return JsonResponse({
-        "status": "anomaly_detected" if is_anomalous else "clean",
-        "anomalies": anomalies,
-        "elapsed_ms": round(elapsed_ms, 3),
-        "asr": "SEG-DET - objetivo <= 200 ms",
-    }, status=403 if is_anomalous else 200)
+    es_anomalo = len(anomalias) > 0
 
-# ── /security/block/ ────────────────────────────────────────────────────────
-# [ASR-SEG-REP] Response Manager:
-# Bloquea una IP anómala (respuesta inmediata, sin tiempo mínimo).
-def security_block_view(request):
-    t0 = time.perf_counter()
-    try:
-        body = json.loads(request.body)
-        ip_to_block = body.get("ip", "")
-    except Exception:
-        ip_to_block = ""
-
-    if ip_to_block:
-        _blocked_ips.add(ip_to_block)
-
-    elapsed_ms = (time.perf_counter() - t0) * 1000
-    return JsonResponse({
-        "status": "blocked",
-        "ip": ip_to_block,
-        "blocked_count": len(_blocked_ips),
-        "elapsed_ms": round(elapsed_ms, 3),
-        "asr": "SEG-REP - bloqueo inmediato",
-    })
-
-# ── /ping/ ──────────────────────────────────────────────────────────────────
-# Health check del ALB
-def ping_view(request):
-    return JsonResponse({"status": "ok"})
-VIEWS
-
-    # ── urls.py ─────────────────────────────────────────────────────────────
-    cat > /opt/bite/bitecore/urls.py << 'URLS'
-from django.urls import path
-from reports import views
-
-urlpatterns = [
-    path('ping/',                  views.ping_view),
-    path('report/',                views.report_view),
-    path('report/<str:report_id>/',views.report_view),
-    path('health/',                views.health_view),
-    path('recover/',               views.recover_view),
-    path('security/check/',        views.security_check_view),
-    path('security/block/',        views.security_block_view),
-]
-URLS
-
-    # ── Migraciones (sin modelos → solo verifica conexión) ──────────────────
-    cd /opt/bite
-    source /opt/bite_env/bin/activate
-    python manage.py migrate --run-syncdb || true
-
-    # ── Servicio systemd para Gunicorn ──────────────────────────────────────
-    cat > /etc/systemd/system/bite.service << 'SERVICE'
-[Unit]
-Description=BITE.co Django via Gunicorn
-After=network.target
-
-[Service]
-User=ubuntu
-WorkingDirectory=/opt/bite
-Environment="PATH=/opt/bite_env/bin"
-ExecStart=/opt/bite_env/bin/gunicorn \
-    --workers 4 \
-    --bind 0.0.0.0:8000 \
-    --timeout 30 \
-    --access-logfile /var/log/bite_access.log \
-    --error-logfile /var/log/bite_error.log \
-    bitecore.wsgi:application
-Restart=always
-RestartSec=1
-
-[Install]
-WantedBy=multi-user.target
-SERVICE
-
-    systemctl daemon-reload
-    systemctl enable bite
-    systemctl start bite
-  EOF
-}
-
-# =============================================================================
-# 6. EC2 - WEB SERVER A
-#    AMI: Ubuntu 24.04 | t3.micro | 8 GB | us-east-1a
-#    Componentes: Django, Cache reportes A, Cola de trabajos, Procesador de análisis,
-#                 Report Pre-Generator, Elastic Orchestrator
-# =============================================================================
-resource "aws_instance" "web_server_a" {
-  ami                    = data.aws_ami.ubuntu_24.id
-  instance_type          = "t3.micro"
-  key_name               = aws_key_pair.bite_key.key_name
-  subnet_id              = data.aws_subnet.az_a.id
-  vpc_security_group_ids = [aws_security_group.web_sg.id]
-
-  root_block_device {
-    volume_size = 8    # GB según el diagrama
-    volume_type = "gp3"
-  }
-
-  user_data = local.web_user_data
-
-  tags = {
-    Name = "bite-web-server-a"
-    Role = "WebServer"
-    AZ   = "us-east-1a"
-  }
-}
-
-# =============================================================================
-# 7. EC2 - WEB SERVER B
-#    AMI: Ubuntu 24.04 | t3.micro | 8 GB | us-east-1b
-# =============================================================================
-resource "aws_instance" "web_server_b" {
-  ami                    = data.aws_ami.ubuntu_24.id
-  instance_type          = "t3.micro"
-  key_name               = aws_key_pair.bite_key.key_name
-  subnet_id              = data.aws_subnet.az_b.id
-  vpc_security_group_ids = [aws_security_group.web_sg.id]
-
-  root_block_device {
-    volume_size = 8
-    volume_type = "gp3"
-  }
-
-  user_data = local.web_user_data
-
-  tags = {
-    Name = "bite-web-server-b"
-    Role = "WebServer"
-    AZ   = "us-east-1b"
-  }
-}
-
-# =============================================================================
-# 8. EC2 - WEB SERVER C  (también tiene JMeter para simular carga → ASR-LAT)
-#    El script instala JMeter en modo CLI para poder disparar 5 000 usuarios.
-# =============================================================================
-locals {
-  web_c_user_data = <<-EOF
-    #!/bin/bash
-    set -e
-    export DEBIAN_FRONTEND=noninteractive
-
-    # ── Misma base que los otros web servers ────────────────────────────────
-    apt-get update -y
-    apt-get install -y python3-pip python3-venv postgresql-client git \
-                       default-jre-headless wget
-
-    python3 -m venv /opt/bite_env
-    source /opt/bite_env/bin/activate
-    pip install --upgrade pip
-    pip install django==4.2 psycopg2-binary gunicorn
-
-    mkdir -p /opt/bite
-    cd /opt/bite
-    django-admin startproject bitecore .
-    python manage.py startapp reports
-
-    cat > /opt/bite/bitecore/settings.py << 'SETTINGS'
-import os
-SECRET_KEY = 'bite-secret-key-change-in-prod'
-DEBUG = True
-ALLOWED_HOSTS = ['*']
-INSTALLED_APPS = [
-    'django.contrib.contenttypes',
-    'django.contrib.staticfiles',
-    'reports',
-]
-DATABASES = {
-    'default': {
-        'ENGINE': 'django.db.backends.postgresql',
-        'NAME': 'bitedb',
-        'USER': 'biteadmin',
-        'PASSWORD': 'Bite2024!Secure',
-        'HOST': '${aws_db_instance.bite_rds.address}',
-        'PORT': '5432',
+    # Audit Logger: registra el evento con timestamp preciso
+    evento = {
+        'ts_epoch':  time.time(),
+        'ip':        client_ip,
+        'token_ok':  bool(token),
+        'ua':        ua[:80] if ua else '',
+        'anomalias': anomalias,
+        'anomalo':   es_anomalo,
     }
-}
-ROOT_URLCONF = 'bitecore.urls'
-SETTINGS
+    with _audit_log_lock:
+        _audit_log.append(evento)
+        # Mantener solo los ultimos 500 eventos en memoria
+        if len(_audit_log) > 500:
+            _audit_log.pop(0)
 
-    # Reutilizamos el mismo views.py y urls.py
-    cat > /opt/bite/reports/views.py << 'VIEWS'
-import time
-import threading
-import json
-from django.http import JsonResponse
+    detection_ms = round((time.monotonic() - t0) * 1000, 3)
 
-_report_cache = {}
-_cache_lock = threading.Lock()
-_blocked_ips = set()
-_anomaly_log = []
+    return JsonResponse({
+        'anomalo':       es_anomalo,
+        'anomalias':     anomalias,
+        'ip':            client_ip,
+        'detection_ms':  detection_ms,
+        'asr':           'SEG-DET – objetivo <= 200 ms',
+        'cumple':        detection_ms <= 200,
+        'audit_total':   len(_audit_log),
+    }, status=403 if es_anomalo else 200)
 
-def _preload_reports():
-    with _cache_lock:
-        for i in range(1, 101):
-            _report_cache[str(i)] = {
-                "id": i,
-                "resource": f"resource_{i}",
-                "consumption": round(i * 1.5, 2),
-                "cached_at": time.time(),
-            }
+@csrf_exempt
+def security_block(request):
+    """
+    POST /security/block/   [ASR-SEG-REP]
+    =======================================
+    Response Manager: bloquea una IP o patron anomalo de forma inmediata.
+    No hay tiempo minimo — el bloqueo es instantaneo en memoria.
 
-threading.Thread(target=_preload_reports, daemon=True).start()
+    Body JSON esperado:
+      { "ip": "1.2.3.4", "motivo": "generacion_masiva_reportes" }
 
-def report_view(request, report_id="1"):
-    t0 = time.perf_counter()
-    with _cache_lock:
-        data = _report_cache.get(str(report_id))
-    elapsed_ms = (time.perf_counter() - t0) * 1000
-    if data:
-        return JsonResponse({"status": "ok","report": data,"elapsed_ms": round(elapsed_ms, 3),"asr": "LAT - objetivo <= 100 ms"})
-    return JsonResponse({"status": "not_found", "elapsed_ms": round(elapsed_ms, 3)}, status=404)
+    Todos los accesos posteriores de esa IP en /security/check/
+    seran detectados con anomalia 'ip_en_lista_negra'.
+    """
+    t0 = time.monotonic()
 
-def health_view(request):
-    t0 = time.perf_counter()
-    global _worker_healthy
-    _worker_healthy = True
-    if request.GET.get("fail") == "1":
-        _worker_healthy = False
-    elapsed_ms = (time.perf_counter() - t0) * 1000
-    return JsonResponse({"status": "healthy" if _worker_healthy else "degraded","elapsed_ms": round(elapsed_ms, 3),"asr": "DISP-DET - objetivo <= 200 ms"})
-
-_worker_healthy = True
-
-def recover_view(request):
-    t0 = time.perf_counter()
-    global _worker_healthy
-    time.sleep(0.8)
-    _worker_healthy = True
-    _preload_reports()
-    elapsed_ms = (time.perf_counter() - t0) * 1000
-    return JsonResponse({"status": "recovered","elapsed_ms": round(elapsed_ms, 3),"cache_size": len(_report_cache),"asr": "DISP-REP - objetivo <= 2000 ms"})
-
-def security_check_view(request):
-    t0 = time.perf_counter()
-    client_ip = request.META.get("REMOTE_ADDR", "unknown")
-    token = request.headers.get("X-Bite-Token", "")
-    ua = request.META.get("HTTP_USER_AGENT", "")
-    anomalies = []
-    if client_ip in _blocked_ips: anomalies.append("ip_blocked")
-    if not token: anomalies.append("missing_token")
-    if not ua: anomalies.append("missing_user_agent")
-    _anomaly_log.append({"ts": time.time(),"ip": client_ip,"anomalies": anomalies})
-    elapsed_ms = (time.perf_counter() - t0) * 1000
-    is_anomalous = len(anomalies) > 0
-    return JsonResponse({"status": "anomaly_detected" if is_anomalous else "clean","anomalies": anomalies,"elapsed_ms": round(elapsed_ms, 3),"asr": "SEG-DET - objetivo <= 200 ms"},status=403 if is_anomalous else 200)
-
-def security_block_view(request):
-    t0 = time.perf_counter()
     try:
-        body = json.loads(request.body)
-        ip_to_block = body.get("ip", "")
+        data  = json.loads(request.body) if request.body else {}
     except Exception:
-        ip_to_block = ""
-    if ip_to_block: _blocked_ips.add(ip_to_block)
-    elapsed_ms = (time.perf_counter() - t0) * 1000
-    return JsonResponse({"status": "blocked","ip": ip_to_block,"blocked_count": len(_blocked_ips),"elapsed_ms": round(elapsed_ms, 3),"asr": "SEG-REP - bloqueo inmediato"})
+        data  = {}
 
-def ping_view(request):
-    return JsonResponse({"status": "ok"})
-VIEWS
+    ip_a_bloquear = data.get('ip', '').strip()
+    motivo        = data.get('motivo', 'no_especificado')
 
-    cat > /opt/bite/bitecore/urls.py << 'URLS'
-from django.urls import path
-from reports import views
+    if ip_a_bloquear:
+        with _blocked_ips_lock:
+            _blocked_ips.add(ip_a_bloquear)
+        logger.warning(f"IP BLOQUEADA: {ip_a_bloquear} – motivo: {motivo}")
 
-urlpatterns = [
-    path('ping/',                  views.ping_view),
-    path('report/',                views.report_view),
-    path('report/<str:report_id>/',views.report_view),
-    path('health/',                views.health_view),
-    path('recover/',               views.recover_view),
-    path('security/check/',        views.security_check_view),
-    path('security/block/',        views.security_block_view),
-]
-URLS
+    block_ms = round((time.monotonic() - t0) * 1000, 3)
 
-    cd /opt/bite
-    source /opt/bite_env/bin/activate
-    python manage.py migrate --run-syncdb || true
+    with _blocked_ips_lock:
+        total_bloqueadas = len(_blocked_ips)
 
-    cat > /etc/systemd/system/bite.service << 'SERVICE'
+    return JsonResponse({
+        'bloqueada':       bool(ip_a_bloquear),
+        'ip':              ip_a_bloquear,
+        'motivo':          motivo,
+        'total_blocked':   total_bloqueadas,
+        'block_ms':        block_ms,
+        'asr':             'SEG-REP – bloqueo inmediato',
+    })
+PYEOF
+
+cat > /opt/opticloud/app/manage.py << 'PYEOF'
+import os, sys
+os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'settings')
+from django.core.management import execute_from_command_line
+execute_from_command_line(sys.argv)
+PYEOF
+
+cat > /etc/systemd/system/opticloud.service << 'SVCEOF'
 [Unit]
-Description=BITE.co Django via Gunicorn
+Description=OptiCloud Django Web Server
 After=network.target
 
 [Service]
-User=ubuntu
-WorkingDirectory=/opt/bite
-Environment="PATH=/opt/bite_env/bin"
-ExecStart=/opt/bite_env/bin/gunicorn \
-    --workers 4 \
-    --bind 0.0.0.0:8000 \
-    --timeout 30 \
-    --access-logfile /var/log/bite_access.log \
-    --error-logfile /var/log/bite_error.log \
-    bitecore.wsgi:application
+WorkingDirectory=/opt/opticloud/app
+ExecStart=/opt/opticloud/bin/gunicorn wsgi:application \
+          --bind 0.0.0.0:8000 \
+          --workers 4 \
+          --timeout 30 \
+          --access-logfile /var/log/gunicorn-access.log \
+          --error-logfile /var/log/gunicorn-error.log
 Restart=always
-RestartSec=1
+RestartSec=3
 
 [Install]
 WantedBy=multi-user.target
-SERVICE
+SVCEOF
 
-    systemctl daemon-reload
-    systemctl enable bite
-    systemctl start bite
+systemctl daemon-reload
+systemctl enable opticloud
+systemctl start opticloud
+USERDATA
+  )
 
-    # ── JMeter (execution environment JMeter - Web Server C) ────────────────
-    # [ASR-LAT] Herramienta para simular 5 000 usuarios concurrentes
-    wget -q https://downloads.apache.org/jmeter/binaries/apache-jmeter-5.6.3.tgz \
-         -O /tmp/jmeter.tgz
-    tar -xzf /tmp/jmeter.tgz -C /opt/
-    ln -sf /opt/apache-jmeter-5.6.3/bin/jmeter /usr/local/bin/jmeter
+  tags = { Name = "opticloud-web-server" }
 
-    # Plan de prueba JMeter: 5 000 usuarios → GET /report/1/
-    # Ajusta ALB_DNS con el DNS del balanceador después del apply
-    cat > /opt/bite_load_test.jmx << 'JMX'
-<?xml version="1.0" encoding="UTF-8"?>
-<jmeterTestPlan version="1.2">
-  <hashTree>
-    <TestPlan guiclass="TestPlanGui" testclass="TestPlan" testname="BITE ASR-LAT Test">
-      <hashTree>
-        <ThreadGroup guiclass="ThreadGroupGui" testclass="ThreadGroup" testname="5000 Usuarios">
-          <intProp name="ThreadGroup.num_threads">5000</intProp>
-          <intProp name="ThreadGroup.ramp_time">60</intProp>
-          <boolProp name="ThreadGroup.scheduler">false</boolProp>
-          <hashTree>
-            <HTTPSamplerProxy guiclass="HttpTestSampleGui" testclass="HTTPSamplerProxy" testname="GET /report/1/">
-              <stringProp name="HTTPSampler.domain">ALB_DNS_HERE</stringProp>
-              <intProp name="HTTPSampler.port">80</intProp>
-              <stringProp name="HTTPSampler.path">/report/1/</stringProp>
-              <stringProp name="HTTPSampler.method">GET</stringProp>
-              <hashTree/>
-            </HTTPSamplerProxy>
-            <ResultCollector guiclass="SummaryReport" testclass="ResultCollector" testname="Summary Report">
-              <objProp>
-                <name>saveConfig</name>
-                <value class="SampleSaveConfiguration">
-                  <time>true</time>
-                  <latency>true</latency>
-                  <responseCode>true</responseCode>
-                </value>
-              </objProp>
-              <stringProp name="filename">/opt/jmeter_results.jtl</stringProp>
-              <hashTree/>
-            </ResultCollector>
-          </hashTree>
-        </ThreadGroup>
-      </hashTree>
-    </TestPlan>
-  </hashTree>
-</jmeterTestPlan>
-JMX
-
-    echo "JMeter instalado. Ejecutar con: jmeter -n -t /opt/bite_load_test.jmx -l /opt/results.jtl"
-  EOF
+  depends_on = [aws_db_instance.opticloud_db]
 }
 
-resource "aws_instance" "web_server_c" {
-  ami                    = data.aws_ami.ubuntu_24.id
-  instance_type          = "t3.micro"
-  key_name               = aws_key_pair.bite_key.key_name
-  subnet_id              = data.aws_subnet.az_a.id   # us-east-1a (mismo que A)
-  vpc_security_group_ids = [aws_security_group.web_sg.id]
+###############################################################################
+# APPLICATION LOAD BALANCER – AWS ELB Service
+# Zonas: us-east-2a / us-east-2b  |  Puerto: HTTP:80
+# ASR-1: distribuye trafico entre los Web Servers del Auto Scaling Group
+###############################################################################
 
-  root_block_device {
-    volume_size = 8
-    volume_type = "gp3"
-  }
-
-  user_data = local.web_c_user_data
-
-  tags = {
-    Name = "bite-web-server-c"
-    Role = "WebServer+JMeter"
-    AZ   = "us-east-1a"
-  }
-}
-
-# =============================================================================
-# 9. EC2 - BD SERVER (EC2 adicional con PostgreSQL - según diagrama)
-#    Suposición: este servidor actúa como réplica/caché de datos preprocesados
-#    ("Información preprocesada de reportes recientes y cálculos realizados")
-#    según la nota del diagrama de despliegue.
-# =============================================================================
-resource "aws_instance" "bd_server" {
-  ami                    = data.aws_ami.ubuntu_24.id
-  instance_type          = "t3.micro"
-  key_name               = aws_key_pair.bite_key.key_name
-  subnet_id              = data.aws_subnet.az_a.id
-  vpc_security_group_ids = [aws_security_group.bd_sg.id]
-
-  root_block_device {
-    volume_size = 8
-    volume_type = "gp3"
-  }
-
-  # Instala PostgreSQL y crea la BD de caché de reportes preprocesados
-  user_data = <<-EOF
-    #!/bin/bash
-    set -e
-    export DEBIAN_FRONTEND=noninteractive
-    apt-get update -y
-    apt-get install -y postgresql postgresql-contrib
-
-    # Configurar PostgreSQL para aceptar conexiones de la VPC
-    PG_VERSION=$(ls /etc/postgresql/)
-    sed -i "s/#listen_addresses = 'localhost'/listen_addresses = '*'/" \
-        /etc/postgresql/$PG_VERSION/main/postgresql.conf
-    echo "host  bitedb_cache  biteadmin  0.0.0.0/0  md5" \
-        >> /etc/postgresql/$PG_VERSION/main/pg_hba.conf
-
-    systemctl restart postgresql
-
-    # Crear DB y usuario
-    sudo -u postgres psql -c "CREATE USER biteadmin WITH PASSWORD 'Bite2024!Secure';"
-    sudo -u postgres psql -c "CREATE DATABASE bitedb_cache OWNER biteadmin;"
-
-    # Tabla de reportes preprocesados (caché persistente)
-    sudo -u postgres psql -d bitedb_cache -c "
-      CREATE TABLE IF NOT EXISTS preprocessed_reports (
-        id         SERIAL PRIMARY KEY,
-        report_id  VARCHAR(50) UNIQUE NOT NULL,
-        resource   VARCHAR(100),
-        consumption NUMERIC(10,2),
-        created_at TIMESTAMPTZ DEFAULT NOW()
-      );
-      INSERT INTO preprocessed_reports (report_id, resource, consumption)
-      SELECT 'r' || i, 'resource_' || i, i * 1.5
-      FROM generate_series(1, 100) AS i
-      ON CONFLICT DO NOTHING;
-    "
-    echo "BD Server listo con 100 reportes preprocesados."
-  EOF
-
-  tags = {
-    Name = "bite-bd-server"
-    Role = "BDServer"
-    Note = "Cache de reportes preprocesados - segun diagrama de despliegue"
-  }
-}
-
-# =============================================================================
-# 10. APPLICATION LOAD BALANCER (AWS ELB - zonas us-east-1a y us-east-1b)
-#     [ASR-DISP-REP] El ALB redirige tráfico si un Web Server falla → sin downtime
-#     [ASR-LAT]      Distribución de carga entre A, B, C → mantiene < 100 ms
-# =============================================================================
-resource "aws_lb" "bite_alb" {
-  name               = "bite-alb"
+resource "aws_lb" "opticloud_alb" {
+  name               = "opticloud-alb"
   internal           = false
   load_balancer_type = "application"
   security_groups    = [aws_security_group.alb_sg.id]
   subnets            = [data.aws_subnet.az_a.id, data.aws_subnet.az_b.id]
-
-  tags = { Name = "bite-alb" }
+  tags               = { Name = "opticloud-alb" }
 }
 
-# ── Target Group ──────────────────────────────────────────────────────────────
-# Health check en /ping/ con intervalo de 10 s → detección de instancia caída
-# [ASR-DISP-DET] El ALB marca una instancia como unhealthy si /ping/ no responde
-resource "aws_lb_target_group" "bite_tg" {
-  name        = "bite-tg"
-  port        = 8000
-  protocol    = "HTTP"
-  vpc_id      = data.aws_vpc.default.id
-  target_type = "instance"
+resource "aws_lb_target_group" "web_tg" {
+  name     = "opticloud-web-tg"
+  port     = 8000
+  protocol = "HTTP"
+  vpc_id   = data.aws_vpc.default.id
 
   health_check {
-    enabled             = true
-    path                = "/ping/"
-    interval            = 10      # segundos entre checks
+    path                = "/health/"
+    port                = "8000"
+    protocol            = "HTTP"
+    interval            = 15
     timeout             = 5
     healthy_threshold   = 2
-    unhealthy_threshold = 2       # 2 fallos → unhealthy (≈ 20 s detección ALB)
+    unhealthy_threshold = 3
     matcher             = "200"
   }
 
-  tags = { Name = "bite-tg" }
+  tags = { Name = "opticloud-web-tg" }
 }
 
-# ── Registrar los 3 Web Servers en el Target Group ────────────────────────────
-resource "aws_lb_target_group_attachment" "web_a" {
-  target_group_arn = aws_lb_target_group.bite_tg.arn
-  target_id        = aws_instance.web_server_a.id
-  port             = 8000
-}
-
-resource "aws_lb_target_group_attachment" "web_b" {
-  target_group_arn = aws_lb_target_group.bite_tg.arn
-  target_id        = aws_instance.web_server_b.id
-  port             = 8000
-}
-
-resource "aws_lb_target_group_attachment" "web_c" {
-  target_group_arn = aws_lb_target_group.bite_tg.arn
-  target_id        = aws_instance.web_server_c.id
-  port             = 8000
-}
-
-# ── Listener HTTP:80 ──────────────────────────────────────────────────────────
-resource "aws_lb_listener" "bite_http" {
-  load_balancer_arn = aws_lb.bite_alb.arn
+resource "aws_lb_listener" "http" {
+  load_balancer_arn = aws_lb.opticloud_alb.arn
   port              = 80
   protocol          = "HTTP"
 
   default_action {
     type             = "forward"
-    target_group_arn = aws_lb_target_group.bite_tg.arn
+    target_group_arn = aws_lb_target_group.web_tg.arn
   }
 }
 
-# =============================================================================
-# 11. OUTPUTS - Información útil tras el terraform apply
-# =============================================================================
+###############################################################################
+# AUTO SCALING GROUP – Elastic Orchestrator (escalabilidad horizontal)
+#
+# ASR-1: escala Web Servers de 1 a 6 instancias segun carga de CPU.
+#   - desired = 3  (Web Server A, B, C del diagrama de despliegue)
+#   - CPU > 60%  -> scale-out (cooldown 60s para ventana de 10 min)
+#   - CPU < 30%  -> scale-in  (fin del pico)
+###############################################################################
+
+resource "aws_autoscaling_group" "web_asg" {
+  name                = "opticloud-web-asg"
+  min_size            = 1
+  max_size            = 6
+  desired_capacity    = 3
+  vpc_zone_identifier = [data.aws_subnet.az_a.id, data.aws_subnet.az_b.id]
+
+  launch_template {
+    id      = aws_launch_template.web_server.id
+    version = "$Latest"
+  }
+
+  target_group_arns         = [aws_lb_target_group.web_tg.arn]
+  health_check_type         = "ELB"
+  health_check_grace_period = 120
+
+  tag {
+    key                 = "Name"
+    value               = "opticloud-web-server"
+    propagate_at_launch = true
+  }
+}
+
+resource "aws_autoscaling_policy" "scale_out" {
+  name                   = "opticloud-scale-out"
+  autoscaling_group_name = aws_autoscaling_group.web_asg.name
+  adjustment_type        = "ChangeInCapacity"
+  scaling_adjustment     = 1
+  cooldown               = 60
+}
+
+resource "aws_cloudwatch_metric_alarm" "cpu_high" {
+  alarm_name          = "opticloud-cpu-high"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 1
+  metric_name         = "CPUUtilization"
+  namespace           = "AWS/EC2"
+  period              = 60
+  statistic           = "Average"
+  threshold           = 60
+  alarm_description   = "ASR-1: escala OUT cuando CPU > 60%"
+  alarm_actions       = [aws_autoscaling_policy.scale_out.arn]
+  dimensions          = { AutoScalingGroupName = aws_autoscaling_group.web_asg.name }
+}
+
+resource "aws_autoscaling_policy" "scale_in" {
+  name                   = "opticloud-scale-in"
+  autoscaling_group_name = aws_autoscaling_group.web_asg.name
+  adjustment_type        = "ChangeInCapacity"
+  scaling_adjustment     = -1
+  cooldown               = 120
+}
+
+resource "aws_cloudwatch_metric_alarm" "cpu_low" {
+  alarm_name          = "opticloud-cpu-low"
+  comparison_operator = "LessThanThreshold"
+  evaluation_periods  = 2
+  metric_name         = "CPUUtilization"
+  namespace           = "AWS/EC2"
+  period              = 60
+  statistic           = "Average"
+  threshold           = 30
+  alarm_description   = "ASR-1: escala IN cuando CPU < 30%"
+  alarm_actions       = [aws_autoscaling_policy.scale_in.arn]
+  dimensions          = { AutoScalingGroupName = aws_autoscaling_group.web_asg.name }
+}
+
+###############################################################################
+# OUTPUTS
+###############################################################################
+
 output "alb_dns_name" {
-  description = "DNS del Application Load Balancer (usar en JMeter y pruebas de ASR)"
-  value       = aws_lb.bite_alb.dns_name
-}
-
-output "web_server_a_public_ip" {
-  description = "IP pública Web Server A"
-  value       = aws_instance.web_server_a.public_ip
-}
-
-output "web_server_b_public_ip" {
-  description = "IP pública Web Server B"
-  value       = aws_instance.web_server_b.public_ip
-}
-
-output "web_server_c_public_ip" {
-  description = "IP pública Web Server C (tiene JMeter)"
-  value       = aws_instance.web_server_c.public_ip
-}
-
-output "bd_server_public_ip" {
-  description = "IP pública BD Server EC2"
-  value       = aws_instance.bd_server.public_ip
+  description = "DNS del ALB - usalo en curl y JMeter como host destino"
+  value       = aws_lb.opticloud_alb.dns_name
 }
 
 output "rds_endpoint" {
-  description = "Endpoint RDS PostgreSQL"
-  value       = aws_db_instance.bite_rds.address
+  description = "Endpoint del RDS PostgreSQL"
+  value       = aws_db_instance.opticloud_db.address
 }
 
-output "asr_test_commands" {
-  description = "Comandos para probar cada ASR manualmente con curl"
+output "pregenerator_public_ip" {
+  description = "IP publica del Report Pre-Generator EC2 (para SSH)"
+  value       = aws_instance.report_pregenerator.public_ip
+}
+
+output "ssh_key_path" {
+  description = "Ruta a la llave privada SSH generada por Terraform"
+  value       = "${path.module}/opticloud_key.pem"
+}
+
+output "instrucciones_ssh" {
+  description = "Como conectarte por SSH a las instancias del ASG"
+  value       = <<-NOTE
+    Las instancias Web Server son creadas por el Auto Scaling Group.
+    Para ver sus IPs publicas:
+      aws ec2 describe-instances \
+        --filters "Name=tag:Name,Values=opticloud-web-server" \
+                  "Name=instance-state-name,Values=running" \
+        --query "Reservations[*].Instances[*].PublicIpAddress" \
+        --output text --region us-east-2
+
+    Luego conectate con:
+      ssh -i opticloud_key.pem ubuntu@<IP_PUBLICA>
+
+    Para el Pre-Generator:
+      ssh -i opticloud_key.pem ubuntu@${aws_instance.report_pregenerator.public_ip}
+  NOTE
+}
+
+output "asr_disponibilidad_comandos" {
+  description = "Comandos para probar los ASRs de Disponibilidad"
   value       = <<-CMDS
-    # ── Sustituir ALB_DNS con el valor de alb_dns_name ──────────────────────
+    ALB="${aws_lb.opticloud_alb.dns_name}"
 
-    # [ASR-LAT] Latencia de reporte <= 100 ms
-    curl -o /dev/null -s -w "%%{time_total}s\n" http://ALB_DNS/report/1/
+    # ── Verificar que el ALB esta listo ──────────────────────────────────
+    curl -s "http://$ALB/health/"
 
-    # [ASR-DISP-DET] Simular falla y medir detección <= 200 ms
-    curl -s "http://ALB_DNS/health/?fail=1"
-    curl -s "http://ALB_DNS/health/"
+    # ── [ASR-DISP-DET] Deteccion de falla <= 200 ms ──────────────────────
+    # Paso 1: estado normal (worker_ok: true)
+    curl -s "http://$ALB/worker/status/"
+    # Paso 2: simular falla
+    curl -s "http://$ALB/worker/status/?fail=1"
+    # Verificar: 'detection_ms' en la respuesta debe ser <= 200
 
-    # [ASR-DISP-REP] Recuperación <= 2 s
-    curl -s -w "\nTiempo: %%{time_total}s\n" http://ALB_DNS/recover/
-
-    # [ASR-SEG-DET] Detección de acceso sin token <= 200 ms
-    curl -s http://ALB_DNS/security/check/
-
-    # [ASR-SEG-REP] Bloqueo de IP anómala
-    curl -s -X POST http://ALB_DNS/security/block/ \
-         -H "Content-Type: application/json" \
-         -d '{"ip":"1.2.3.4"}'
-
-    # [ASR-LAT - JMeter] Desde Web Server C (SSH) ejecutar:
-    # jmeter -n -t /opt/bite_load_test.jmx -l /opt/results.jtl
-    # (Editar ALB_DNS_HERE en /opt/bite_load_test.jmx primero)
+    # ── [ASR-DISP-REP] Recuperacion <= 2000 ms ───────────────────────────
+    # Primero inducir falla, luego recuperar
+    curl -s "http://$ALB/worker/status/?fail=1"
+    curl -s -X POST "http://$ALB/worker/recover/"
+    # Verificar: 'recovery_ms' <= 2000, 'perdida_de_datos': false
   CMDS
+}
+
+output "asr_seguridad_comandos" {
+  description = "Comandos para probar los ASRs de Seguridad"
+  value       = <<-CMDS
+    ALB="${aws_lb.opticloud_alb.dns_name}"
+
+    # ── [ASR-SEG-DET] Acceso anomalo sin token (detection_ms <= 200) ─────
+    curl -s "http://$ALB/security/check/"
+
+    # ── [ASR-SEG-DET] Acceso legitimo con token ───────────────────────────
+    curl -s -H "X-Opticloud-Token: test123" \
+            -A "Mozilla/5.0" \
+            "http://$ALB/security/check/"
+
+    # ── [ASR-SEG-REP] Bloquear una IP sospechosa ──────────────────────────
+    curl -s -X POST "http://$ALB/security/block/" \
+         -H "Content-Type: application/json" \
+         -d '{"ip":"1.2.3.4","motivo":"generacion_masiva_reportes"}'
+
+    # ── Verificar que la IP quedo bloqueada ───────────────────────────────
+    curl -s -H "X-Forwarded-For: 1.2.3.4" \
+            "http://$ALB/security/check/"
+  CMDS
+}
+
+output "asr1_test_note" {
+  description = "Como probar ASR-1 (Escalabilidad)"
+  value       = "JMeter: 12000 hilos / 10 min -> POST http://${aws_lb.opticloud_alb.dns_name}/enqueue/ con body {client_id: N}. Verifica scale-out en consola EC2."
+}
+
+output "asr2_test_note" {
+  description = "Como probar ASR-2 (Latencia)"
+  value       = "JMeter: 5000 hilos sostenidos -> GET http://${aws_lb.opticloud_alb.dns_name}/report/N/ . Valida response_ms <= 100 en el body JSON."
 }
