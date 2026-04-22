@@ -34,6 +34,11 @@ terraform {
       source  = "hashicorp/local"
       version = "~> 2.0"
     }
+    # FIX: provider para comprimir user_data con gzip y superar el límite de 16 KB
+    cloudinit = {
+      source  = "hashicorp/cloudinit"
+      version = "~> 2.0"
+    }
   }
   required_version = ">= 1.3.0"
 }
@@ -574,7 +579,30 @@ resource "aws_launch_template" "web_server" {
     }
   }
 
-  user_data = base64encode(<<-USERDATA
+  # FIX InvalidUserData.Malformed: el script supera 16 KB embebido inline.
+  # Se delega la codificación al data source "cloudinit_config" (gzip + base64)
+  # que comprime el contenido antes de codificar, reduciendo el tamaño ~70%.
+  user_data = data.cloudinit_config.web_server_init.rendered
+
+  tags = { Name = "opticloud-web-server" }
+
+  depends_on = [aws_db_instance.opticloud_db]
+}
+
+###############################################################################
+# CLOUD-INIT CONFIG – Web Server user_data comprimido con gzip
+# El bloque resource aws_launch_template referencia este data source.
+# gzip=true + base64_encode=true produce un user_data válido para AWS EC2
+# que se mantiene muy por debajo del límite de 16 384 bytes.
+###############################################################################
+
+data "cloudinit_config" "web_server_init" {
+  gzip          = true
+  base64_encode = true
+
+  part {
+    content_type = "text/x-shellscript"
+    content      = <<-SCRIPT
 #!/bin/bash
 set -e
 apt-get update -y
@@ -1115,12 +1143,8 @@ SVCEOF
 systemctl daemon-reload
 systemctl enable opticloud
 systemctl start opticloud
-USERDATA
-  )
-
-  tags = { Name = "opticloud-web-server" }
-
-  depends_on = [aws_db_instance.opticloud_db]
+SCRIPT
+  }
 }
 
 ###############################################################################
