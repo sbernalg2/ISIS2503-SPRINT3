@@ -311,7 +311,7 @@ resource "aws_launch_template" "web_server" {
     }
   }
 
-  user_data = base64encode(file("${path.module}/scripts/setup_webserver.sh"))
+  user_data = file("${path.module}/scripts/setup_webserver.sh.b64gz")
 
   tags = { Name = "opticloud-web-server" }
 

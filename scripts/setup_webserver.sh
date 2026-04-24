@@ -1,4 +1,3 @@
-#!/bin/bash
 set -e
 apt-get update -y
 apt-get install -y python3 python3-pip python3-venv
@@ -93,8 +92,6 @@ def _pg():
         dbname=DB_NAME, user=DB_USER,
         password=DB_PASS, host=DB_HOST, port=5432
     )
-
-# Estado compartido
 _cache            = {}
 _cache_lock       = threading.Lock()
 _worker_ok        = True
@@ -103,8 +100,6 @@ _blocked_ips      = set()
 _blocked_ips_lock = threading.Lock()
 _audit_log        = []
 _audit_log_lock   = threading.Lock()
-
-# ── Bootstrap ────────────────────────────────────────────────────────────────
 def _bootstrap():
     for attempt in range(10):
         try:
@@ -152,8 +147,6 @@ def _bootstrap():
         except Exception as e:
             logger.warning(f"Bootstrap intento {attempt+1}/10: {e}")
             time.sleep(10)
-
-# ── Report Pre-Generator thread ──────────────────────────────────────────────
 def _pregenerate_worker():
     logger.info("Pre-Generator iniciando...")
     while True:
@@ -182,8 +175,6 @@ def _pregenerate_worker():
         except Exception as e:
             logger.error(f"Pre-Generator error: {e}")
         time.sleep(60)
-
-# ── Procesador de Analisis thread ────────────────────────────────────────────
 def _job_processor():
     logger.info("Procesador de Analisis iniciando...")
     while True:
@@ -226,8 +217,6 @@ def _job_processor():
             logger.error(f"Job processor error: {e}")
             time.sleep(2)
         time.sleep(0.5)
-
-# Arrancar threads background al cargar el modulo
 _bg_started = False
 def _start_bg():
     global _bg_started
@@ -238,23 +227,13 @@ def _start_bg():
         threading.Thread(target=_job_processor,      name='JobProcessor',  daemon=True).start()
 
 _start_bg()
-
-# ── Validador de resultados ───────────────────────────────────────────────────
-# [ASR-DISP-REP] Verifica que un reporte tenga todos los campos antes de
-# cargarlo al cache. Sin perdida = todos los reportes pasan la validacion.
 def validate_report(payload: dict) -> tuple:
     campos = ['client_id', 'cpu_usage', 'memory_usage', 'disk_io', 'status']
     errores = [c for c in campos if c not in payload]
     return len(errores) == 0, errores
 
-# ════════════════════════════════════════════════════════════════════════════
-# ENDPOINTS
-# ════════════════════════════════════════════════════════════════════════════
-
 def health_check(request):
     return JsonResponse({'status': 'ok'})
-
-# ── ASR-2 Latencia ───────────────────────────────────────────────────────────
 def get_report(request, cid):
     t0  = time.monotonic()
     key = hashlib.md5(f"client_{cid}".encode()).hexdigest()
@@ -283,8 +262,6 @@ def get_report(request, cid):
     except Exception as e:
         ms = round((time.monotonic() - t0) * 1000, 3)
         return JsonResponse({'error': str(e), 'response_ms': ms}, status=500)
-
-# ── ASR-1 Cola de trabajos ───────────────────────────────────────────────────
 @csrf_exempt
 def enqueue_job(request):
     if request.method != 'POST':
@@ -337,8 +314,6 @@ def job_status(request, jid):
         })
     except Exception as e:
         return JsonResponse({'error': str(e)}, status=500)
-
-# ── Elastic Orchestrator ─────────────────────────────────────────────────────
 def metrics(request):
     with _cache_lock:
         cache_size = len(_cache)
@@ -361,8 +336,6 @@ def metrics(request):
         'jobs_done':            done,
         'status':               'running',
     })
-
-# ── ASR-DISP-DET: Health Monitor ─────────────────────────────────────────────
 def worker_status(request):
     """
     Detecta falla en la generacion de reportes.
@@ -399,8 +372,6 @@ def worker_status(request):
         'estado':       'operacional' if estado else 'FALLA_DETECTADA',
         'asr':          'DISP-DET - objetivo <= 200 ms',
     })
-
-# ── ASR-DISP-REP: Exception Handler + Validador de resultados ────────────────
 @csrf_exempt
 def worker_recover(request):
     """
@@ -418,13 +389,9 @@ def worker_recover(request):
     pasos              = []
     reportes_validos   = 0
     reportes_invalidos = 0
-
-    # Exception Handler: atrapa el error y reinicia el worker
     with _worker_lock:
         _worker_ok = True
     pasos.append('exception_handler_reinicio_worker')
-
-    # Validador de resultados: recarga cache verificando cada reporte
     try:
         conn = _pg()
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -443,8 +410,6 @@ def worker_recover(request):
         pasos.append(f'validador_verifico_{reportes_validos}_reportes_ok')
     except Exception as e:
         pasos.append(f'cache_reload_error: {str(e)}')
-
-    # Elastic Orchestrator confirma disponibilidad
     pasos.append('disponibilidad_confirmada')
 
     recovery_ms = round((time.monotonic() - t0) * 1000, 3)
@@ -459,8 +424,6 @@ def worker_recover(request):
         'perdida_de_datos':   False,
         'asr':                'DISP-REP - objetivo <= 2000 ms',
     })
-
-# ── ASR-SEG-DET: IDS + Autenticador + Anomaly Detector + Audit Logger ────────
 def security_check(request):
     """
     Detecta accesos anomalos en <= 200 ms.
@@ -530,8 +493,6 @@ def security_check(request):
         'audit_total':  len(_audit_log),
         'asr':          'SEG-DET - objetivo <= 200 ms',
     }, status=403 if es_anomalo else 200)
-
-# ── ASR-SEG-REP: Response Manager ────────────────────────────────────────────
 @csrf_exempt
 def security_block(request):
     """
@@ -570,8 +531,6 @@ def security_block(request):
         'block_ms':      block_ms,
         'asr':           'SEG-REP - bloqueo inmediato',
     })
-
-# ── Audit Logger: consulta ────────────────────────────────────────────────────
 def security_audit(request):
     """Consulta los ultimos 50 eventos de seguridad registrados."""
     with _audit_log_lock:
