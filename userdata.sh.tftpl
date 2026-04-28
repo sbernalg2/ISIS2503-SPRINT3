@@ -1,0 +1,427 @@
+#!/bin/bash
+# ============================================================================
+# user_data para los Web Servers de OptiCloud
+# Instala Django + middlewares que materializan los componentes del diagrama
+# ============================================================================
+set -e
+exec > >(tee /var/log/user-data.log) 2>&1
+echo "=== INICIO setup OptiCloud Web Server: ${server_name} ==="
+
+apt-get update -y
+apt-get install -y python3-pip python3-venv curl
+
+# Crear directorio de la app y virtualenv
+mkdir -p /opt/opticloud
+cd /opt/opticloud
+python3 -m venv venv
+# shellcheck source=/dev/null
+source venv/bin/activate
+pip install --upgrade pip
+pip install "django==5.0.*" gunicorn psycopg2-binary
+
+# ----------------------------------------------------------------------------
+# Estructura de la app Django
+# ----------------------------------------------------------------------------
+mkdir -p /opt/opticloud/app
+touch /opt/opticloud/app/__init__.py
+
+# manage.py
+cat > /opt/opticloud/manage.py <<'PYEOF'
+#!/usr/bin/env python
+import os, sys
+if __name__ == "__main__":
+    os.environ.setdefault("DJANGO_SETTINGS_MODULE", "app.settings")
+    from django.core.management import execute_from_command_line
+    execute_from_command_line(sys.argv)
+PYEOF
+
+# settings.py - registra los middlewares = componentes del diagrama
+cat > /opt/opticloud/app/settings.py <<'PYEOF'
+import os
+SECRET_KEY = "opticloud-demo-key-not-for-prod"
+DEBUG = False
+ALLOWED_HOSTS = ["*"]
+ROOT_URLCONF = "app.urls"
+INSTALLED_APPS = ["django.contrib.contenttypes", "django.contrib.auth"]
+
+# Orden de middlewares = orden de pipe & filter del diagrama de componentes
+MIDDLEWARE = [
+    "app.middlewares.HealthMonitorMiddleware",     # Health Monitor (envuelve todo - ASR Disp.)
+    "app.middlewares.ExceptionHandlerMiddleware",  # Exception Handler (recovery)
+    "app.middlewares.AuditLoggerMiddleware",       # Audit Logger
+    "app.middlewares.AnomalyDetectorMiddleware",   # Anomaly Detector
+    "app.middlewares.AutenticadorMiddleware",      # Autenticador
+    "app.middlewares.IDSMiddleware",               # IDS - detecta spoofing
+    "app.middlewares.ResponseManagerMiddleware",   # Response Manager
+]
+
+DATABASES = {
+    "default": {
+        "ENGINE": "django.db.backends.postgresql",
+        "NAME": os.environ.get("DB_NAME", "opticloud"),
+        "USER": os.environ.get("DB_USER", "opticloud_admin"),
+        "PASSWORD": os.environ.get("DB_PASSWORD", ""),
+        "HOST": os.environ.get("DB_HOST", "localhost"),
+        "PORT": "5432",
+        "CONN_MAX_AGE": 60,
+    }
+}
+
+TEMPLATES = [{
+    "BACKEND": "django.template.backends.django.DjangoTemplates",
+    "DIRS": [], "APP_DIRS": True, "OPTIONS": {},
+}]
+DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
+IS_PRIMARY = os.environ.get("IS_PRIMARY", "false").lower() == "true"
+SERVER_NAME = os.environ.get("SERVER_NAME", "unknown")
+PYEOF
+
+# wsgi.py
+cat > /opt/opticloud/app/wsgi.py <<'PYEOF'
+import os
+from django.core.wsgi import get_wsgi_application
+os.environ.setdefault("DJANGO_SETTINGS_MODULE", "app.settings")
+application = get_wsgi_application()
+PYEOF
+
+# ----------------------------------------------------------------------------
+# middlewares.py - Cada middleware = un componente del diagrama.
+# Lógica MÍNIMA pero suficiente para validar los 4 ASRs.
+# ----------------------------------------------------------------------------
+cat > /opt/opticloud/app/middlewares.py <<'PYEOF'
+"""
+Middlewares = componentes del diagrama de despliegue de OptiCloud.
+Cada uno emula su rol con la lógica mínima necesaria para los ASRs.
+"""
+import time, os, logging
+from collections import defaultdict, deque
+from django.http import JsonResponse
+
+# Logger compartido para el componente Audit Logger
+logging.basicConfig(
+    filename="/var/log/opticloud-audit.log",
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+)
+audit_log = logging.getLogger("audit")
+
+# Estado en memoria para Anomaly Detector (rate limiting por IP)
+_request_history = defaultdict(lambda: deque(maxlen=200))
+BLOCKED_IPS = set()
+
+
+# =====================================================================
+# COMPONENTE: HEALTH MONITOR
+# ASR DISPONIBILIDAD - DETECCIÓN (<= 200ms)
+# Mide el tiempo de cada request y detecta excepciones al instante.
+# =====================================================================
+class HealthMonitorMiddleware:
+    def __init__(self, get_response):
+        self.get_response = get_response
+
+    def __call__(self, request):
+        t0 = time.perf_counter()
+        request._health_t0 = t0
+        try:
+            response = self.get_response(request)
+        except Exception as e:
+            detection_ms = (time.perf_counter() - t0) * 1000
+            audit_log.error(
+                f"HEALTH_FAILURE_DETECTED detection_ms={detection_ms:.3f} error={e}"
+            )
+            raise
+        elapsed_ms = (time.perf_counter() - t0) * 1000
+        response["X-Health-Detection-Ms"] = f"{elapsed_ms:.3f}"
+        response["X-Health-Asr-Detection"] = "PASS" if elapsed_ms <= 200 else "FAIL"
+        return response
+
+
+# =====================================================================
+# COMPONENTE: EXCEPTION HANDLER (Web Server A - primary - según diagrama)
+# ASR DISPONIBILIDAD - REPARACIÓN (<= 2s)
+# Captura excepciones y devuelve respuesta degradada inmediatamente.
+# El ALB se encarga de re-rutear futuras requests a otros targets.
+# =====================================================================
+class ExceptionHandlerMiddleware:
+    def __init__(self, get_response):
+        self.get_response = get_response
+        self.is_primary = os.environ.get("IS_PRIMARY", "false").lower() == "true"
+
+    def __call__(self, request):
+        t0 = time.perf_counter()
+        try:
+            return self.get_response(request)
+        except Exception as e:
+            recovery_ms = (time.perf_counter() - t0) * 1000
+            audit_log.error(
+                f"EXCEPTION_RECOVERED recovery_ms={recovery_ms:.3f} "
+                f"primary={self.is_primary} error={e}"
+            )
+            return JsonResponse(
+                {
+                    "error": "Service degraded - request recovered",
+                    "recovery_ms": round(recovery_ms, 3),
+                    "asr_availability_repair": "PASS" if recovery_ms <= 2000 else "FAIL",
+                    "handled_by_primary": self.is_primary,
+                    "server": os.environ.get("SERVER_NAME", "unknown"),
+                },
+                status=503,
+            )
+
+
+# =====================================================================
+# COMPONENTE: AUDIT LOGGER
+# Registra evidencia de cada acceso (requisito del enunciado).
+# =====================================================================
+class AuditLoggerMiddleware:
+    def __init__(self, get_response):
+        self.get_response = get_response
+
+    def __call__(self, request):
+        response = self.get_response(request)
+        ip = request.META.get("REMOTE_ADDR", "")
+        audit_log.info(
+            f"REQUEST ip={ip} path={request.path} status={response.status_code}"
+        )
+        return response
+
+
+# =====================================================================
+# COMPONENTE: ANOMALY DETECTOR
+# ASR SEGURIDAD - REPARACIÓN
+# Detecta y bloquea patrones anómalos: misma IP haciendo muchas requests
+# en poco tiempo (consultas atípicas, generación masiva de reportes).
+# =====================================================================
+class AnomalyDetectorMiddleware:
+    WINDOW_SECONDS = 10
+    MAX_REQUESTS_IN_WINDOW = 50  # umbral demo
+
+    def __init__(self, get_response):
+        self.get_response = get_response
+
+    def __call__(self, request):
+        ip = request.META.get("REMOTE_ADDR", "")
+        # Si ya está bloqueada, rechaza inmediatamente
+        if ip in BLOCKED_IPS:
+            return JsonResponse(
+                {"error": "IP bloqueada por comportamiento anómalo previo"},
+                status=429,
+            )
+
+        now = time.time()
+        history = _request_history[ip]
+        history.append(now)
+        recent = [t for t in history if now - t <= self.WINDOW_SECONDS]
+        if len(recent) > self.MAX_REQUESTS_IN_WINDOW:
+            BLOCKED_IPS.add(ip)
+            audit_log.warning(
+                f"ANOMALY_BLOCKED ip={ip} requests={len(recent)} "
+                f"window={self.WINDOW_SECONDS}s"
+            )
+            return JsonResponse(
+                {
+                    "error": "Comportamiento anómalo detectado. IP bloqueada.",
+                    "requests_in_window": len(recent),
+                },
+                status=429,
+            )
+        return self.get_response(request)
+
+
+# =====================================================================
+# COMPONENTE: AUTENTICADOR
+# Validación simple por token X-Auth-Token (basta para demo de ASRs).
+# =====================================================================
+class AutenticadorMiddleware:
+    def __init__(self, get_response):
+        self.get_response = get_response
+
+    def __call__(self, request):
+        # endpoints públicos usados por el ALB
+        if request.path in ("/health", "/metrics", "/"):
+            request.is_authenticated = True
+            return self.get_response(request)
+        token = request.headers.get("X-Auth-Token", "")
+        request.is_authenticated = token.startswith("valid-")
+        return self.get_response(request)
+
+
+# =====================================================================
+# COMPONENTE: IDS
+# ASR SEGURIDAD - DETECCIÓN SPOOFING (<= 200ms)
+# Detecta accesos no autorizados midiendo el tiempo. La detección es
+# síncrona en memoria, por lo que dura microsegundos (muy < 200ms).
+# =====================================================================
+class IDSMiddleware:
+    def __init__(self, get_response):
+        self.get_response = get_response
+
+    def __call__(self, request):
+        t0 = time.perf_counter()
+
+        # Endpoints abiertos
+        if request.path in ("/health", "/metrics", "/"):
+            return self.get_response(request)
+
+        # Detección de spoofing: token inválido
+        spoofing_detected = not getattr(request, "is_authenticated", False)
+        detection_ms = (time.perf_counter() - t0) * 1000
+
+        if spoofing_detected:
+            ip = request.META.get("REMOTE_ADDR", "")
+            audit_log.warning(
+                f"IDS_SPOOFING_DETECTED ip={ip} path={request.path} "
+                f"detection_ms={detection_ms:.6f}"
+            )
+            return JsonResponse(
+                {
+                    "error": "Acceso no autorizado detectado y bloqueado",
+                    "ids_detection_ms": round(detection_ms, 6),
+                    "asr_security_detection": "PASS" if detection_ms <= 200 else "FAIL",
+                },
+                status=403,
+            )
+        return self.get_response(request)
+
+
+# =====================================================================
+# COMPONENTE: RESPONSE MANAGER
+# Estandariza las respuestas y agrega headers informativos.
+# =====================================================================
+class ResponseManagerMiddleware:
+    def __init__(self, get_response):
+        self.get_response = get_response
+
+    def __call__(self, request):
+        response = self.get_response(request)
+        response["X-Server-Name"] = os.environ.get("SERVER_NAME", "unknown")
+        response["X-Is-Primary"] = os.environ.get("IS_PRIMARY", "false")
+        return response
+PYEOF
+
+# ----------------------------------------------------------------------------
+# urls.py - endpoints para validar los ASRs
+# ----------------------------------------------------------------------------
+cat > /opt/opticloud/app/urls.py <<'PYEOF'
+from django.urls import path
+from django.http import JsonResponse
+import os, time
+
+
+def home(request):
+    return JsonResponse({
+        "service": "OptiCloud",
+        "server": os.environ.get("SERVER_NAME", "unknown"),
+        "is_primary": os.environ.get("IS_PRIMARY", "false"),
+        "endpoints": [
+            "/health",
+            "/metrics",
+            "/report",
+            "/report/heavy",
+            "/simulate-failure",
+        ],
+    })
+
+
+def health(request):
+    # Endpoint usado por el ALB para health check.
+    # Si responde 200 el target está sano; si no, el ALB lo saca.
+    return JsonResponse({
+        "status": "ok",
+        "server": os.environ.get("SERVER_NAME", "unknown"),
+    })
+
+
+def metrics(request):
+    # Recolector de métricas / Report Cache (versión demo)
+    return JsonResponse({
+        "server": os.environ.get("SERVER_NAME", "unknown"),
+        "uptime_hint": "ver /var/log/opticloud-audit.log",
+    })
+
+
+def report(request):
+    # Reporte mensual demo - el enunciado pide <= 100ms; simulamos 50ms.
+    t0 = time.perf_counter()
+    time.sleep(0.05)
+    elapsed_ms = (time.perf_counter() - t0) * 1000
+    return JsonResponse({
+        "report": "Consumo mensual demo",
+        "elapsed_ms": round(elapsed_ms, 3),
+        "server": os.environ.get("SERVER_NAME", "unknown"),
+    })
+
+
+def report_heavy(request):
+    # Análisis pesado (>2s): el enunciado dice ejecutar en background y
+    # notificar por correo. Aquí solo devolvemos 202 simulando el encolado.
+    return JsonResponse({
+        "status": "accepted",
+        "message": "Análisis encolado (>2s). Notificación por email cuando finalice.",
+    }, status=202)
+
+
+def simulate_failure(request):
+    # Endpoint que dispara una falla para PROBAR los ASRs de Disponibilidad
+    # (Detección + Reparación). El Health Monitor mide y el Exception
+    # Handler captura y responde con recovery_ms.
+    raise RuntimeError("Falla simulada en generación de reporte")
+
+
+urlpatterns = [
+    path("", home),
+    path("health", health),
+    path("metrics", metrics),
+    path("report", report),
+    path("report/heavy", report_heavy),
+    path("simulate-failure", simulate_failure),
+]
+PYEOF
+
+# ----------------------------------------------------------------------------
+# Variables de entorno con la configuración de la instancia
+# Las vars con $${...} las inyecta Terraform al renderizar el template;
+# las vars literales del shell quedan como están.
+# ----------------------------------------------------------------------------
+cat > /etc/opticloud.env <<EOF
+DB_NAME=opticloud
+DB_USER=${db_user}
+DB_PASSWORD=${db_password}
+DB_HOST=${db_host}
+SERVER_NAME=${server_name}
+IS_PRIMARY=${is_primary}
+DJANGO_SETTINGS_MODULE=app.settings
+EOF
+
+# ----------------------------------------------------------------------------
+# Servicio systemd - corre Django con Gunicorn en el puerto 8000
+# Restart=always + RestartSec=2 ayuda al ASR de reparación: si el proceso
+# muere, systemd lo levanta en menos de 2 segundos.
+# ----------------------------------------------------------------------------
+cat > /etc/systemd/system/opticloud.service <<'EOF'
+[Unit]
+Description=OptiCloud Django (Gunicorn)
+After=network.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/opticloud.env
+WorkingDirectory=/opt/opticloud
+ExecStart=/opt/opticloud/venv/bin/gunicorn app.wsgi:application --bind 0.0.0.0:8000 --workers 2 --timeout 30
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# Permisos y arranque
+chown -R ubuntu:ubuntu /opt/opticloud
+touch /var/log/opticloud-audit.log
+chmod 666 /var/log/opticloud-audit.log
+
+systemctl daemon-reload
+systemctl enable opticloud
+systemctl start opticloud
+
+echo "=== FIN setup OptiCloud Web Server: ${server_name} ==="
